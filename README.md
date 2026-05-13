@@ -13,9 +13,9 @@
 
 ---
 
-## What is Terra?
+## Terra
 
-Terra is a reinforcement learning environment that trains agentic LLMs to solve real-world multi-step tasks using verifiable rewards. Built on the [GAIA](https://arxiv.org/abs/2311.12983) methodology, Terra extends the evaluation framework into a full RL training loop with:
+A reinforcement learning environment that trains agentic LLMs to solve real-world multi-step tasks using verifiable rewards. Built on the [GAIA](https://arxiv.org/abs/2311.12983) methodology, Terra extends the evaluation framework into a full RL training loop with:
 
 - **10,000-task corpus** — GAIA-derived tasks spanning 3 difficulty levels
 - **Sandboxed tool surface** — web search, file I/O, code execution
