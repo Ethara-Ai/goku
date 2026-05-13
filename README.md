@@ -1,56 +1,47 @@
-<p align="center">
-  <h1 align="center">Terra</h1>
-  <p align="center">
-    <strong>Reinforcement Learning Environment for Training Agentic LLMs</strong>
-  </p>
-  <p align="center">
-    <a href="https://huggingface.co/datasets/ethara/terra">Dataset</a> •
-    <a href="https://projects.ethara.ai/terra">Dashboard</a> •
-    <a href="https://arxiv.org/abs/2311.12983">Paper</a> •
-    <a href="https://ethara.ai">Ethara AI</a>
-  </p>
-</p>
+# Terra
+
+[![Python 3.12+](https://img.shields.io/badge/python-3.12+-blue.svg)](https://www.python.org/downloads/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
+[![Dataset on HF](https://img.shields.io/badge/🤗_Dataset-ethara/terra-yellow.svg)](https://huggingface.co/datasets/ethara/terra)
+
+**Reinforcement learning environment for training agentic LLMs on real-world multi-step tasks with verifiable rewards.**
+
+Terra extends the [GAIA](https://arxiv.org/abs/2311.12983) evaluation methodology into a full RL training loop — producing clean binary reward signals suitable for GRPO-based RLVR training. Built on [OpenHands](https://github.com/OpenHands/OpenHands/) and [Agent SDK](https://github.com/OpenHands/software-agent-sdk).
 
 ---
 
-## Terra
+## Key Features
 
-A reinforcement learning environment that trains agentic LLMs to solve real-world multi-step tasks using verifiable rewards. Built on the [GAIA](https://arxiv.org/abs/2311.12983) methodology, Terra extends the evaluation framework into a full RL training loop with:
-
-- **10,000-task corpus** — GAIA-derived tasks spanning 3 difficulty levels
+- **10K-task corpus** — GAIA-derived tasks across 3 difficulty levels
 - **Sandboxed tool surface** — web search, file I/O, code execution
-- **Binary reward oracle** — exact-match scoring designed for GRPO-based RLVR training
-- **End-to-end evaluation harness** — inference, scoring, and trace collection in one pipeline
-
-Built on the [OpenHands](https://github.com/OpenHands/OpenHands/) agent framework and [Agent SDK](https://github.com/OpenHands/software-agent-sdk).
+- **Binary reward oracle** — exact-match scoring for GRPO/RLVR
+- **Trace collection** — full action/observation histories for offline training
+- **End-to-end pipeline** — inference → scoring → trace export in one harness
 
 ---
 
 ## How It Works
 
-Terra uses the GAIA benchmark methodology as its foundation:
+```
+┌─────────────┐     ┌──────────────────┐     ┌────────────────┐     ┌────────────┐
+│  GAIA Tasks │────▶│  Agent Execution │────▶│  Reward Oracle │────▶│   Traces   │
+│  (10K)      │     │  (sandboxed)     │     │  (exact-match) │     │  (RLVR)    │
+└─────────────┘     └──────────────────┘     └────────────────┘     └────────────┘
+```
 
 1. **Tasks** — Multi-step questions requiring web search, file processing, and reasoning
-2. **Agent execution** — LLM agents solve tasks using sandboxed tools (browser, terminal, code interpreter)
-3. **Reward signal** — Binary exact-match scoring against gold answers (suitable for GRPO/RLVR)
-4. **Traces** — Full action/observation histories stored for offline training
-
-The key insight: GAIA's deterministic answers produce clean binary rewards — making it ideal for reinforcement learning from verifiable rewards (RLVR).
+2. **Agent execution** — LLM agents solve tasks in sandboxed environments (browser, terminal, code interpreter)
+3. **Reward signal** — Binary exact-match against gold answers → clean signal for GRPO
+4. **Traces** — Full conversation histories stored for offline RL training
 
 ---
 
-## Reference Results
+## Quick Start
 
-Validation subset (20 tasks) evaluated end-to-end with full execution traces:
+### Prerequisites
 
-|  | Level 1 | Level 2 | Level 3 | Overall |
-|---|---|---|---|---|
-| **Kimi K2.5** | 100.0% | 85.7% | 0.0% | 50.0% |
-| **Qwen3 VL** | 25.0% | 14.3% | 0.0% | 10.0% |
-
----
-
-## Getting Started
+- Python 3.12+
+- [uv](https://docs.astral.sh/uv/) ≥ 0.8.13
 
 ### Installation
 
@@ -62,19 +53,17 @@ make build
 
 ### Configure LLM
 
-Create a config at `.llm_config/your-model.json`:
-
-```json
+```bash
+# Create config
+cat > .llm_config/your-model.json << 'EOF'
 {
   "model": "your-model-name",
   "base_url": "https://your-endpoint",
   "api_key": "YOUR_API_KEY"
 }
-```
+EOF
 
-Validate the config:
-
-```bash
+# Validate
 uv run validate-cfg .llm_config/your-model.json
 ```
 
@@ -95,29 +84,30 @@ uv run python -m benchmarks.gaia.get_score --file outputs/gaia/output.jsonl
 
 ---
 
+## Results
+
+Validation subset (20 tasks), end-to-end with full execution traces:
+
+| Model | Level 1 | Level 2 | Level 3 | Overall |
+|-------|---------|---------|---------|---------|
+| Kimi K2.5 | 100.0% | 85.7% | 0.0% | **50.0%** |
+| Qwen3 VL | 25.0% | 14.3% | 0.0% | 10.0% |
+
+---
+
 ## Dataset
 
-The curated Terra dataset is available on HuggingFace:
+**[ethara/terra](https://huggingface.co/datasets/ethara/terra)** on HuggingFace — 10,000 GAIA-derived tasks.
 
-**[ethara/terra](https://huggingface.co/datasets/ethara/terra)** — 10,000 GAIA-derived tasks
+| Field | Description |
+|-------|-------------|
+| `task_id` | Unique identifier |
+| `Question` | Multi-step task prompt |
+| `Level` | Difficulty (1–3) |
+| `Final answer` | Gold answer for exact-match scoring |
+| `file_name` | Attached file (PNG, CSV, XLSX, PDF, MP4) |
 
-Contents:
-- Task definitions in JSONL format (3 difficulty levels)
-- File attachments (PNG, CSV, XLSX, PDF, MP4)
-- Full agent execution traces for Kimi K2.5 and Qwen3 VL
-
-### Task Format
-
-```json
-{
-  "task_id": "d20ef263-7b51-4fae-9d32-3669faa68cff",
-  "Question": "Examine the attached image of a mathematics problem...",
-  "Level": 3,
-  "Final answer": "905",
-  "file_name": "d20ef263-7b51-4fae-9d32-3669faa68cff.png",
-  "file_path": "validation/d20ef263-7b51-4fae-9d32-3669faa68cff.png"
-}
-```
+Also includes full agent execution traces for Kimi K2.5 and Qwen3 VL.
 
 ---
 
@@ -126,17 +116,31 @@ Contents:
 ```
 terra/
 ├── benchmarks/
-│   └── gaia/              # GAIA evaluation harness
-│       ├── run_infer.py   # Inference pipeline
-│       ├── get_score.py   # Exact-match scoring
-│       └── README.md      # GAIA-specific documentation
+│   └── gaia/
+│       ├── run_infer.py        # Inference pipeline
+│       ├── get_score.py        # Exact-match scoring
+│       └── README.md           # Benchmark-specific docs
 ├── vendor/
-│   └── agent-sdk/         # OpenHands Agent SDK (submodule)
-├── .llm_config/           # LLM configuration files
-├── outputs/               # Inference results & traces
-├── Makefile               # Build automation
-└── pyproject.toml         # Dependencies & CLI entrypoints
+│   └── software-agent-sdk/     # OpenHands Agent SDK (submodule)
+├── .llm_config/                # LLM configuration files
+├── outputs/                    # Inference results & traces
+├── Makefile                    # Build automation
+└── pyproject.toml              # Dependencies & CLI entrypoints
 ```
+
+---
+
+## Development
+
+```bash
+make build       # Install deps + pre-commit hooks
+make format      # Format with ruff
+make lint        # Lint with ruff
+make pre-commit  # Run all pre-commit checks
+make clean       # Remove cache files
+```
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
 
 ---
 
@@ -155,4 +159,4 @@ terra/
 
 ## License
 
-Contact [Ethara AI](https://www.ethara.ai) for licensing information.
+MIT — see [LICENSE](LICENSE) for details.
