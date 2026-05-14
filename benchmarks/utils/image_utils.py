@@ -103,11 +103,14 @@ def create_docker_workspace(
     force_build = os.getenv("FORCE_BUILD", "0").lower() in ("1", "true", "yes")
     if not force_build and local_image_exists(agent_server_image):
         logger.info(f"Using pre-built image {agent_server_image}")
-        return DockerWorkspace(
-            server_image=agent_server_image,
-            working_dir=working_dir,
-            forward_env=forward_env or [],
-        )
+        kwargs: dict = {
+            "server_image": agent_server_image,
+            "working_dir": working_dir,
+            "forward_env": forward_env or [],
+        }
+        if platform:
+            kwargs["platform"] = platform
+        return DockerWorkspace(**kwargs)
     else:
         if force_build:
             logger.info(f"FORCE_BUILD set, building workspace from {base_image}...")

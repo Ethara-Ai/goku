@@ -13,7 +13,7 @@ UNDERLINE := \033[4m
 # Required uv version
 REQUIRED_UV_VERSION := 0.8.13
 
-.PHONY: build format lint clean help check-uv-version
+.PHONY: build format lint clean help check-uv-version test test-goku
 
 # Default target
 .DEFAULT_GOAL := help
@@ -57,6 +57,13 @@ pre-commit:
 	@uv run pre-commit run --all-files
 	@$(ECHO) "$(GREEN)Pre-commit run successfully.$(RESET)"
 
+test: test-goku
+
+test-goku:
+	@$(ECHO) "$(YELLOW)Running goku unit tests...$(RESET)"
+	@uv run pytest benchmarks/goku/tests/ -v
+	@$(ECHO) "$(GREEN)goku tests passed.$(RESET)"
+
 clean:
 	@$(ECHO) "$(YELLOW)Cleaning up cache files...$(RESET)"
 	@find . -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true
@@ -74,5 +81,6 @@ help:
 	@$(ECHO) "  $(GREEN)format$(RESET)               Format code with ruff"
 	@$(ECHO) "  $(GREEN)lint$(RESET)                 Lint code with ruff"
 	@$(ECHO) "  $(GREEN)pre-commit$(RESET)           Run pre-commit hooks"
+	@$(ECHO) "  $(GREEN)test$(RESET)                 Run goku benchmark unit tests"
 	@$(ECHO) "  $(GREEN)clean$(RESET)                Clean up cache files"
 	@$(ECHO) "  $(GREEN)help$(RESET)                 Show this help message"

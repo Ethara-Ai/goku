@@ -1,0 +1,1 @@
+I'm attaching a photo of an item. Please identify what it is, estimate when it was made, and describe two or three distinguishing features. Save your answer as a JSON file named `item_id.json` with keys: `name`, `era`, and `distinguishing_features` (a list).
