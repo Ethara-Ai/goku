@@ -339,21 +339,21 @@ model_to_slug() {
 }
 
 # Substring of the inference output-dir name to pass via `goku-eval --models`.
-# Source eval_outputs dirs use the standard OpenHands convention
-# `<sanitized_model_id>_sdk_<sha>_maxiter_<N>`, so we pass substrings that
-# match those — the LLM config's filename stem alone doesn't appear in
-# source dirs unless display_name happens to equal the stem. Using a
-# substring of the actual sanitized identifier keeps matching robust.
-# get_model_display_name() in delivery export maps these to clean folder
-# names (claude-opus, gpt5.5, gemini-3.1).
+# Source eval_outputs dirs use the OpenHands convention
+# `<display_name>_sdk_<sha>_maxiter_<N>`, where display_name comes from the
+# LLM config's filename stem (e.g. `.llm_config/claude-opus-4.7.json`
+# -> dir starts with `claude-opus-4.7_sdk_...`). Derived dynamically from
+# the auto-discovered config paths so the slug always matches the actual
+# dir name regardless of what annotators name their configs.
 model_to_export_slug() {
     local model="$1"
-    case "$model" in
-        opus)   echo "bedrock_converse_arn" ;;
-        gpt)    echo "openai" ;;
-        gemini) echo "gemini" ;;
-        *)      echo "$model" ;;
-    esac
+    local cfg
+    cfg=$(model_to_config "$model")
+    if [[ -z "$cfg" ]]; then
+        echo "$model"
+        return
+    fi
+    basename "$cfg" .json
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -365,20 +365,25 @@ is_run_complete() {
     local model="$2"
     local run_num="$3"
 
-    # Standard OpenHands layout: ${OUTPUT_BASE}/run_${run_num}/run_1/goku/<sanitized_model>_sdk_<sha>_maxiter_<N>/
+    # Standard OpenHands layout: ${OUTPUT_BASE}/run_${run_num}/run_1/goku/<display>_sdk_<sha>_maxiter_<N>/<task>/scores.jsonl
     local search_dir="${OUTPUT_BASE}/run_${run_num}/run_1/goku"
     if [[ ! -d "$search_dir" ]]; then
         return 1
     fi
-    local model_pattern
+    # Derive pattern from the LLM config filename stem (matches inference
+    # dir naming). Falls back to legacy patterns so we can still resume
+    # against older eval_outputs/ data produced by pre-display_name runs.
+    local export_slug
+    export_slug=$(model_to_export_slug "$model")
+    local legacy_pattern
     case "$model" in
-        opus)   model_pattern="bedrock_converse_arn" ;;
-        gpt)    model_pattern="openai" ;;
-        gemini) model_pattern="gemini_gemini" ;;
-        *)      model_pattern="$model" ;;
+        opus)   legacy_pattern="bedrock_converse_arn" ;;
+        gpt)    legacy_pattern="openai_gpt" ;;
+        gemini) legacy_pattern="gemini_gemini" ;;
+        *)      legacy_pattern="$model" ;;
     esac
     if find "$search_dir" -path "*/${task}/scores.jsonl" 2>/dev/null \
-        | grep -q "$model_pattern"; then
+        | grep -qE "/${export_slug}_sdk_|/${legacy_pattern}"; then
         return 0
     fi
     return 1
