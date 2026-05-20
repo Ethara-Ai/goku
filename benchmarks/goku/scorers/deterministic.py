@@ -173,6 +173,63 @@ def _score_probe_dir_exists(
     return True, f"All directories exist: {found}"
 
 
+# Lines that pollute subprocess stderr because our harness's `benchmarks/`
+# package executes `sitecustomize` and Modal-sandbox banners on every Python
+# subprocess. We strip them so the rationale shows the actual error.
+_SHELL_STDERR_NOISE_MARKERS = (
+    "sitecustomize imported",
+    "modal sitecustomize",
+    "modal-client",
+    "run_instance_modal",
+    "OpenHands SDK v",
+    "injected modal",
+    "applied sandbox timing",
+    "applied runtime debug",
+    "Report a bug:",
+    "Get help:",
+    "Scale up:",
+    "Set OPENHANDS",
+)
+
+
+def _clean_shell_stderr(err: str, budget: int = 400) -> str:
+    """Strip harness boot-noise from a subprocess's stderr and return the
+    last ``budget`` characters of what remains.
+
+    Strategy (in order):
+      1. If a Python ``Traceback (most recent call last)`` appears, take
+         everything from that line onward — that's the real error, and it
+         contains the AssertionError / KeyError / etc. that the rubric
+         actually wanted to surface.
+      2. Otherwise, filter out lines matching the known noise markers and
+         the OpenHands banner box, then take the last ``budget`` chars.
+      3. Return "(empty)" if nothing useful remains.
+    """
+    if not err.strip():
+        return "(empty)"
+
+    lines = err.splitlines()
+
+    # 1. Prefer the traceback if one is present.
+    for i, ln in enumerate(lines):
+        if "Traceback (most recent call last)" in ln:
+            tail = "\n".join(lines[i:]).strip()
+            return tail[-budget:] if len(tail) > budget else tail
+
+    # 2. No traceback — filter known noise and take the tail.
+    cleaned: list[str] = []
+    for ln in lines:
+        if any(m in ln for m in _SHELL_STDERR_NOISE_MARKERS):
+            continue
+        if ln.startswith(("+--", "| ")) or ln.strip() == "|":
+            continue
+        cleaned.append(ln)
+    joined = "\n".join(cleaned).strip()
+    if not joined:
+        return "(empty)"
+    return joined[-budget:] if len(joined) > budget else joined
+
+
 def _score_shell_succeeds_real(
     item: RubricItem, output_dir: Path, _response: str
 ) -> tuple[bool, str]:
@@ -192,7 +249,7 @@ def _score_shell_succeeds_real(
         if result.returncode == 0:
             stdout_preview = result.stdout[:200] if result.stdout else "(empty)"
             return True, f"Shell command exited 0. stdout: {stdout_preview}"
-        stderr_preview = result.stderr[:200] if result.stderr else "(empty)"
+        stderr_preview = _clean_shell_stderr(result.stderr or "", budget=400)
         return (
             False,
             f"Shell command exited {result.returncode}. stderr: {stderr_preview}",

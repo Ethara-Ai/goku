@@ -255,50 +255,6 @@ def generate_markdown_report(
     return "\n".join(lines)
 
 
-def _swap_model_identifiers_for_delivery(
-    obj: dict, model_display_name: str
-) -> None:
-    """In-place cosmetic swap on an output.jsonl record, for delivery only.
-
-    - ``metadata.llm.model``                  → ``model_display_name``
-      (original kept in ``metadata.details.actual_llm_model_id``)
-    - ``metadata.details.judge_model``        → ``model_display_name`` for
-      the judge, read from ``metadata.details.judge_model_display_name``
-      if present, else from ``metadata.details.judge_model`` (no-op)
-      (original kept in ``metadata.details.actual_judge_model_id``)
-
-    The source ``eval_outputs`` files are NEVER mutated by this. The
-    swap is applied only to records being written into the delivery folder,
-    so reproducibility info stays intact at the source while delivery shows
-    clean human-readable names. All authoritative identifiers remain
-    accessible via the ``actual_*_id`` fields.
-    """
-    if not isinstance(obj, dict):
-        return
-    meta = obj.get("metadata")
-    if not isinstance(meta, dict):
-        return
-
-    llm = meta.get("llm")
-    details = meta.get("details")
-    if not isinstance(details, dict):
-        details = {}
-        meta["details"] = details
-
-    # Swap the agent LLM identifier
-    if isinstance(llm, dict) and llm.get("model"):
-        actual_id = llm["model"]
-        details["actual_llm_model_id"] = actual_id
-        llm["model"] = model_display_name
-
-    # Swap the judge identifier (uses display name stored at inference time)
-    judge_display = details.get("judge_model_display_name")
-    judge_actual = details.get("judge_model")
-    if judge_display and judge_actual and judge_actual != judge_display:
-        details["actual_judge_model_id"] = judge_actual
-        details["judge_model"] = judge_display
-
-
 def export_delivery_format(
     output_base_dir: Path,
     tasks_source_dir: Path,
@@ -308,15 +264,21 @@ def export_delivery_format(
 ) -> None:
     """Build the full delivery package per the doc spec.
 
-    Produces:
+    Produces (per DIU Goku doc.md Tab 2 folder tree):
         delivery_dir/
         └── tasks/<task_key>/
             ├── instruction.md          (from tasks_source_dir)
             ├── rubrics.jsonl           (from tasks_source_dir)
             ├── data/input_files/       (from tasks_source_dir)
-            └── runs/<display_name>/
-                ├── results/            (agent output files)
-                └── scores.jsonl
+            └── runs/<display_name>/[run_N/]
+                ├── scores.jsonl
+                └── results/
+                    ├── response.md     (model's final response)
+                    └── <artifacts>     (agent-produced files)
+
+    Deliberately NOT shipped (kept in eval_outputs/ for debugging only):
+      - output.jsonl       — full OpenHands trajectory; not in doc spec
+      - results/bash_events/ — raw tool-call event log; not in doc spec
     """
     from benchmarks.goku.config import get_model_display_name
 
@@ -373,51 +335,29 @@ def export_delivery_format(
                 model_run_dir.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(scores_file, model_run_dir / "scores.jsonl")
 
-                # Extract the matching output.jsonl line(s) for this task from
-                # the model-level output.jsonl that lives one directory above
-                # the per-task scores.jsonl. We filter by instance_id so each
-                # task gets only its own line(s). While extracting we apply
-                # the cosmetic transformations that distinguish delivery from
-                # the (technically correct, OpenHands-conventional) source:
-                #   - swap metadata.llm.model -> display name
-                #     (original kept in metadata.details.actual_llm_model_id)
-                #   - swap metadata.details.judge_model -> judge display name
-                #     (original kept in metadata.details.actual_judge_model_id)
-                model_output_jsonl = scores_file.parent.parent / "output.jsonl"
-                if model_output_jsonl.is_file():
-                    matching_lines: list[str] = []
-                    try:
-                        with open(model_output_jsonl, encoding="utf-8") as src:
-                            for raw_line in src:
-                                line = raw_line.rstrip("\n")
-                                if not line.strip():
-                                    continue
-                                try:
-                                    data = json.loads(line)
-                                except json.JSONDecodeError:
-                                    continue
-                                if data.get("instance_id") == task_key:
-                                    _swap_model_identifiers_for_delivery(
-                                        data, display_name
-                                    )
-                                    matching_lines.append(json.dumps(data))
-                    except OSError as exc:
-                        logger.warning(
-                            "Failed reading %s: %s", model_output_jsonl, exc
-                        )
-                        matching_lines = []
-                    if matching_lines:
-                        dest_output = model_run_dir / "output.jsonl"
-                        dest_output.write_text(
-                            "\n".join(matching_lines) + "\n", encoding="utf-8"
-                        )
+                # Source trajectory lives in eval_outputs/, NOT in delivery.
+                # We only read it to extract response.md (below); the raw
+                # trajectory is intentionally not shipped — per doc Tab 2
+                # the delivery contains only scores + response + artifacts.
+                source_output_jsonl = scores_file.parent.parent / "output.jsonl"
 
+                # Copy agent-produced artifacts into delivery results/,
+                # EXCLUDING bash_events/ (internal tool-call log) and
+                # __pycache__/ (Python bytecode cache from any helper
+                # scripts the agent wrote) — neither is part of the
+                # doc-specified deliverable.
                 agent_results = scores_file.parent / "results"
                 if agent_results.is_dir():
                     dest_results = model_run_dir / "results"
                     if dest_results.exists():
                         shutil.rmtree(dest_results)
-                    shutil.copytree(agent_results, dest_results)
+                    shutil.copytree(
+                        agent_results,
+                        dest_results,
+                        ignore=shutil.ignore_patterns(
+                            "bash_events", "__pycache__", "*.pyc"
+                        ),
+                    )
                     # Defensive flatten: if the agent (or a legacy
                     # spec-violating prompt) created a nested `results/`
                     # subdir, lift its contents up one level. Collisions
@@ -432,6 +372,21 @@ def export_delivery_format(
                             nested.rmdir()
                         except OSError:
                             pass  # leave it if non-empty due to collisions
+
+                # Per doc Tab 2 (folder tree), each per-run results/ carries
+                # the model's final natural-language response as response.md
+                # alongside any artifacts. Extracted from the SOURCE
+                # eval_outputs/output.jsonl (never written to delivery).
+                from benchmarks.goku.response_extractor import (
+                    extract_final_response_from_jsonl,
+                    write_response_md,
+                )
+                results_dir = model_run_dir / "results"
+                results_dir.mkdir(parents=True, exist_ok=True)
+                final_response = extract_final_response_from_jsonl(
+                    source_output_jsonl, instance_id=task_key
+                )
+                write_response_md(final_response, results_dir / "response.md")
 
                 logger.info(
                     f"Exported {task_key} / {display_name}"

@@ -135,6 +135,7 @@ DRY_RUN=false
 SPECIFIC_TASKS=""
 SPECIFIC_MODELS=""
 SKIP_EXPORT=false
+RERUN=false  # When true, strip prior resume-state entries for --tasks before launching
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -170,6 +171,14 @@ while [[ $# -gt 0 ]]; do
             SKIP_EXPORT=true
             shift
             ;;
+        --rerun)
+            # Force re-inference of the tasks listed in --tasks by stripping
+            # them from harness resume-state files (output.jsonl AND
+            # output.critic_attempt_*.jsonl) and archiving any per-task
+            # outputs before launching. Required after rubric/prompt edits.
+            RERUN=true
+            shift
+            ;;
         --help|-h)
             echo "Usage: run_batch.sh [OPTIONS]"
             echo ""
@@ -182,6 +191,9 @@ while [[ $# -gt 0 ]]; do
             echo "  --parallel N       Models to run concurrently (default: 3)"
             echo "  --output-dir DIR   Output directory (default: eval_outputs)"
             echo "  --skip-export      Skip delivery export at end"
+            echo "  --rerun            Strip prior resume-state for --tasks before"
+            echo "                     launching. Use after editing a task's prompt"
+            echo "                     or rubric to force fresh re-inference."
             echo "  --help             Show this help"
             exit 0
             ;;
@@ -191,6 +203,13 @@ while [[ $# -gt 0 ]]; do
             ;;
     esac
 done
+
+# Validate --rerun usage early — refuse to silently clean everything
+if [[ "$RERUN" == "true" && -z "$SPECIFIC_TASKS" ]]; then
+    echo "ERROR: --rerun requires --tasks <comma-separated-keys>"
+    echo "       (Refusing to silently strip resume-state for every task)"
+    exit 1
+fi
 
 # ─────────────────────────────────────────────────────────────────────────────
 # SETUP
@@ -478,7 +497,14 @@ run_model_on_task() {
                     log_ok "[${task}] ${model_slug} run ${run_num} — COMPLETE (${duration}s)"
                     success=true
                 else
-                    log_warn "[${task}] ${model_slug} run ${run_num} — finished but no scores.jsonl (${duration}s)"
+                    # Distinguish silent-skip (harness filter) from honest failure
+                    if grep -q "No instances to process" "$model_log" 2>/dev/null; then
+                        log_error "[${task}] ${model_slug} run ${run_num} — HARNESS SKIPPED (${duration}s): \"No instances to process\""
+                        log_error "  This is the resume-state filter blocking re-inference."
+                        log_error "  Fix: re-run this batch with --rerun (strips output.jsonl + output.critic_attempt_*.jsonl)"
+                    else
+                        log_warn "[${task}] ${model_slug} run ${run_num} — finished but no scores.jsonl (${duration}s)"
+                    fi
                 fi
             else
                 local exit_code=$?
@@ -658,6 +684,14 @@ print_summary() {
     log_info "Logs: ${LOG_DIR}"
     log_info "Batch log: ${BATCH_LOG}"
     log_info "═══════════════════════════════════════════════════════"
+
+    # Export the summary counts so the caller (main) can set a non-zero
+    # exit code if nothing actually ran. Without this, a batch where every
+    # task silently failed via the "No instances to process" filter still
+    # reported BATCH COMPLETE with exit 0, masking real failure.
+    BATCH_TOTAL_TASKS=$total_tasks
+    BATCH_FULLY_COMPLETE=$total_complete
+    BATCH_INCOMPLETE=$total_failed
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -733,10 +767,36 @@ main() {
     
     log_info "Found ${#tasks[@]} task(s): ${tasks[*]}"
     log_info ""
-    
+
+    # --rerun: strip prior resume-state for the targeted tasks so the
+    # OpenHands eval harness actually re-runs them. Without this, even
+    # after re-inferring is the intent, the harness sees the task in
+    # output.jsonl and/or output.critic_attempt_*.jsonl and silently
+    # skips it ("No instances to process"), causing a 0-min batch.
+    if [[ "$RERUN" == "true" && ${#tasks[@]} -gt 0 ]]; then
+        local task_csv
+        task_csv=$(IFS=,; echo "${tasks[*]}")
+        log_info "--rerun: cleaning resume-state for: ${task_csv}"
+        if [[ "$DRY_RUN" == "true" ]]; then
+            uv run python -m benchmarks.goku.scripts.clean_resume_state \
+                --output-base "$OUTPUT_BASE" \
+                --tasks "$task_csv" \
+                --dry-run \
+                >> "$BATCH_LOG" 2>&1 \
+                || log_warn "clean_resume_state (dry-run) reported issues; see batch log"
+        else
+            uv run python -m benchmarks.goku.scripts.clean_resume_state \
+                --output-base "$OUTPUT_BASE" \
+                --tasks "$task_csv" \
+                >> "$BATCH_LOG" 2>&1 \
+                || { log_error "clean_resume_state failed; aborting"; exit 1; }
+        fi
+        log_ok "--rerun cleanup complete"
+    fi
+
     # Initial cleanup
     cleanup_docker
-    
+
     # Run each task
     local batch_start
     batch_start=$(date +%s)
@@ -750,13 +810,38 @@ main() {
     local batch_duration=$(( (batch_end - batch_start) / 60 ))
     
     log_info "Total batch time: ${batch_duration} minutes"
-    
+
     # Export delivery
     export_delivery
-    
-    # Print summary
+
+    # Print summary (sets BATCH_TOTAL_TASKS/BATCH_FULLY_COMPLETE/BATCH_INCOMPLETE)
+    BATCH_TOTAL_TASKS=0
+    BATCH_FULLY_COMPLETE=0
+    BATCH_INCOMPLETE=0
     print_summary
-    
+
+    # Distinguish three completion modes so callers (and watchers) can react:
+    #   exit 0  → at least one task fully complete
+    #   exit 2  → nothing ran at all (silent-failure mode we hit on Modal 500s
+    #             and on the output.critic_attempt_1.jsonl filter regression)
+    #   exit 1  → some tasks ran but at least one missed runs
+    if [[ "$DRY_RUN" == "true" ]]; then
+        log_ok "BATCH COMPLETE (dry-run) — ${batch_duration} minutes total"
+        return 0
+    fi
+    if [[ "$BATCH_FULLY_COMPLETE" -eq 0 && "$BATCH_TOTAL_TASKS" -gt 0 ]]; then
+        log_error "BATCH FAILED — 0 of ${BATCH_TOTAL_TASKS} tasks completed in ${batch_duration} minutes."
+        log_error "  Common causes:"
+        log_error "    1. Stale resume-state — try re-running with --rerun"
+        log_error "    2. Docker / Modal agent-server connectivity issues"
+        log_error "    3. LLM config / Bedrock credential rejection"
+        log_error "  Inspect per-model logs in ${LOG_DIR}/${task}_*.log"
+        exit 2
+    fi
+    if [[ "$BATCH_INCOMPLETE" -gt 0 ]]; then
+        log_warn "BATCH PARTIAL — ${BATCH_FULLY_COMPLETE} of ${BATCH_TOTAL_TASKS} tasks fully complete, ${BATCH_INCOMPLETE} incomplete (${batch_duration} min)"
+        exit 1
+    fi
     log_ok "BATCH COMPLETE — ${batch_duration} minutes total"
 }
 

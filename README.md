@@ -141,12 +141,25 @@ bash run_batch.sh --tasks task_abc,task_def       # specific tasks
 bash run_batch.sh --models opus,gemini            # subset of models
 bash run_batch.sh --runs 1 --parallel 1           # quick single-run, sequential
 bash run_batch.sh --dry-run                       # preview without executing
+bash run_batch.sh --tasks task_abc --rerun        # force re-inference (see below)
 bash run_batch.sh --help                          # all options
 ```
 
 The script handles Docker cleanup, run timeouts (default 20 min/run), retries
 (2 attempts/run), and resume (skips already-completed `(task, model, run)`
 combinations).
+
+**Forcing re-inference after editing a task.** Resume is keyed on the
+harness's `output.jsonl` / `output.critic_attempt_*.jsonl`, so editing a
+prompt or rubric and re-running silently skips the task with
+`"No instances to process"`. Pass `--rerun` together with `--tasks` to strip
+those resume-state entries (and archive the previous per-task outputs) before
+launching — required after any prompt or rubric edit. `--rerun` refuses to
+run without `--tasks` to avoid silently wiping the whole batch.
+
+The script exits with **`2`** when zero tasks completed (e.g. silent harness
+skip, Modal 500s, credential rejection) so a watcher can distinguish that
+from a normal partial-success exit `1` or full-success exit `0`.
 
 ### Option 2: single-shot CLI
 
@@ -213,6 +226,31 @@ uv run goku-rescore --output-dir eval_outputs --tasks-dir dataset --dry-run
 so you can compare. `--export-delivery` re-runs the delivery export
 afterwards so the packaged scores reflect the new rubrics.
 
+### Backfilling `response.md` on an existing delivery
+
+`goku-eval --export-delivery` writes `results/response.md` for every run as
+part of the export. If you already have a delivery folder from before this
+landed (or you re-ran inference and want to refresh `response.md` without
+re-exporting the whole delivery), use the standalone backfill CLI:
+
+```bash
+# Backfill every missing response.md, pulling from eval_outputs/
+uv run goku-write-response-md delivery/MM\ Agentic\ Pilot\ Samples-2026-05-15/ \
+    --eval-outputs-root eval_outputs
+
+# Force-overwrite existing response.md (e.g. after re-inference)
+uv run goku-write-response-md delivery/MM\ Agentic\ Pilot\ Samples-2026-05-15/ \
+    --eval-outputs-root eval_outputs --force
+
+# Limit to specific tasks / models, or preview without writing
+uv run goku-write-response-md delivery/.../ --eval-outputs-root eval_outputs \
+    --tasks task_abc,task_def --models claude-opus --dry-run
+```
+
+The script is idempotent — repeated runs against an unchanged trajectory
+produce the same `response.md`. Source trajectories must live in
+`eval_outputs/` (delivery never contains them).
+
 ---
 
 ## Output layout
@@ -243,12 +281,22 @@ delivery/
             └── runs/
                 └── <clean_model_name>/         # claude-opus, gemini-3.1, gpt5.5
                     └── run_N/
-                        ├── output.jsonl
                         ├── scores.jsonl
                         └── results/
-                            ├── bash_events/
+                            ├── response.md     # model's final natural-language response
                             └── <agent-saved files>
 ```
+
+The delivery folder is **intentionally narrower** than `eval_outputs/`:
+`output.jsonl` (the full OpenHands trajectory) and `results/bash_events/`
+(raw tool-call log) stay in `eval_outputs/` for debugging and are not
+shipped — per the doc spec the deliverable is scores + the model's response
++ agent-produced artifacts.
+
+`response.md` is extracted from the source `output.jsonl` (the agent's
+`FinishAction` message, with a fallback to the last agent text event for
+abnormally-terminated runs). It carries the agent's own markdown verbatim
+with no scaffolding.
 
 ---
 
@@ -294,6 +342,9 @@ Benchmark-level (across tasks):
 | Bedrock judge returns `region` errors | Set `AWS_REGION_NAME` env var, or add `"aws_region_name": "..."` to your judge LLM config, or use an ARN-prefixed model (region is auto-parsed) |
 | Agent receives no images | Check that media is in `data/input_files/` (not `data/`). The loader only looks in `data/input_files/` |
 | Delivery folder has nested `results/results/` | Your prompt mentions `results/` — drop that prefix and use a bare filename, then re-export |
+| `No instances to process` and the batch finishes in seconds | Harness resume-state is still holding the task as "done". Re-run `run_batch.sh --tasks <keys> --rerun` to strip `output.jsonl` + `output.critic_attempt_*.jsonl` entries before launching |
+| `BATCH FAILED — 0 of N tasks completed` (exit 2) | Either silent resume-state skip (use `--rerun`), Docker/Modal connectivity issues, or LLM-config credential rejection. Per-model logs are in `batch_logs/<batch_id>/` |
+| Delivery folder has no `response.md` in `results/` | Pre-`response.md`-feature delivery — backfill with `uv run goku-write-response-md <delivery_root> --eval-outputs-root eval_outputs` (see Re-scoring section) |
 
 ---
 

@@ -231,3 +231,10 @@ delivery/
 batch_logs/
 nohup.out
 *.log
+
+# Local junk / pilot artifacts (do not commit)
+.DS_Store
+*.venv.zip
+.venv.zip
+delivery_pilot_v1/
+eval_outputs_pilot_v1/

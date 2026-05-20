@@ -225,3 +225,72 @@ class TestInvalidType:
         item = _make_item(type="response_criteria")
         with pytest.raises(ValueError, match="not deterministic"):
             score_deterministic(item, tmp_path, "")
+
+
+class TestCleanShellStderr:
+    """Verify the harness boot-noise filter on subprocess stderr."""
+
+    def test_empty_stderr_returns_placeholder(self):
+        from benchmarks.goku.scorers.deterministic import _clean_shell_stderr
+        assert _clean_shell_stderr("") == "(empty)"
+        assert _clean_shell_stderr("   \n  ") == "(empty)"
+
+    def test_strips_sitecustomize_banner(self):
+        from benchmarks.goku.scorers.deterministic import _clean_shell_stderr
+        err = (
+            "benchmarks sitecustomize imported\n"
+            "+----------------------------------+\n"
+            "|  OpenHands SDK v1.22.0           |\n"
+            "|  Set OPENHANDS_SUPPRESS_BANNER=1 |\n"
+            "+----------------------------------+\n"
+            "real error here\n"
+        )
+        assert _clean_shell_stderr(err) == "real error here"
+
+    def test_strips_modal_sandbox_noise(self):
+        from benchmarks.goku.scorers.deterministic import _clean_shell_stderr
+        err = (
+            "benchmarks injected modal sitecustomize into run_instance_modal image\n"
+            "[benchmarks] modal sitecustomize: applied sandbox timing patch\n"
+            "[benchmarks] modal sitecustomize: applied runtime debug patch\n"
+            "[modal-client] 2026-05-18 Warning: function name 'run_instance_modal' collision\n"
+            "[benchmarks] modal sitecustomize: patched function timeout to 14400s\n"
+            "AssertionError\n"
+        )
+        assert _clean_shell_stderr(err) == "AssertionError"
+
+    def test_prefers_traceback_when_present(self):
+        from benchmarks.goku.scorers.deterministic import _clean_shell_stderr
+        err = (
+            "benchmarks sitecustomize imported\n"
+            "[benchmarks] modal sitecustomize: applied runtime debug patch\n"
+            "Traceback (most recent call last):\n"
+            '  File "<string>", line 1, in <module>\n'
+            "    assert \"food_items\" in d\n"
+            "AssertionError\n"
+        )
+        result = _clean_shell_stderr(err)
+        assert result.startswith("Traceback")
+        assert "AssertionError" in result
+        # Crucially: no sitecustomize / modal banner content
+        assert "sitecustomize" not in result
+        assert "modal" not in result
+
+    def test_budget_respected_on_huge_input(self):
+        from benchmarks.goku.scorers.deterministic import _clean_shell_stderr
+        err = "garbage line\n" * 1000 + "FINAL ERROR\n"
+        result = _clean_shell_stderr(err, budget=50)
+        assert len(result) <= 50
+        # Tail of the real content should still appear
+        assert "FINAL ERROR" in result
+
+    def test_traceback_budget_takes_tail(self):
+        from benchmarks.goku.scorers.deterministic import _clean_shell_stderr
+        # Very long traceback — we want the AssertionError at the end, not the start
+        err = (
+            "Traceback (most recent call last):\n"
+            + "  File \"long\", line 1, in <module>\n" * 50
+            + "AssertionError: the real error\n"
+        )
+        result = _clean_shell_stderr(err, budget=80)
+        assert "AssertionError: the real error" in result

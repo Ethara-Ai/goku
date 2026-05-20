@@ -18,7 +18,7 @@ so no extra wiring is needed.
 
 from __future__ import annotations
 
-from benchmarks.utils import modal_patches
+from benchmarks.utils import httpx_patches, modal_patches
 
 
 def _apply_modal_logging_patch() -> None:
@@ -26,3 +26,8 @@ def _apply_modal_logging_patch() -> None:
 
 
 _apply_modal_logging_patch()
+# Default httpx clients to follow_redirects=True so the OpenHands SDK
+# RemoteWorkspace clients handle 307s from the Docker agent-server. Scoped
+# to this repo's processes only; the vendored SDK submodule stays pristine
+# so sibling benchmarks pinning the same submodule are unaffected.
+httpx_patches.apply()
