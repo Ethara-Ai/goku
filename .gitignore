@@ -238,3 +238,4 @@ nohup.out
 .venv.zip
 delivery_pilot_v1/
 eval_outputs_pilot_v1/
+sqlite_mcp_server.db

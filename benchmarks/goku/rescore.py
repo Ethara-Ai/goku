@@ -157,6 +157,7 @@ def rescore_single(
     judge_api_key: str | None,
     judge_region: str | None,
     skip_llm_judge: bool,
+    input_image_paths: list[str] | None = None,
 ) -> tuple[list[ScorerResult], list[RubricItem]]:
     """Run all rubric items for one task and return per-item results."""
     results: list[ScorerResult] = []
@@ -182,6 +183,7 @@ def rescore_single(
                     judge_model=judge_model,
                     judge_api_key=judge_api_key,
                     aws_region_name=judge_region,
+                    input_image_paths=input_image_paths or [],
                 ))
         else:
             raise ValueError(
@@ -428,6 +430,11 @@ def main() -> None:
                 judge_api_key=judge_api_key,
                 judge_region=judge_region,
                 skip_llm_judge=args.skip_llm_judge,
+                # task.input_files is populated by load_task() from
+                # dataset/<task>/data/input_files/ — absolute paths to
+                # the task's input media that the judge needs for visual
+                # grounding (otherwise it has only the agent's claims).
+                input_image_paths=task.input_files,  # type: ignore[union-attr]
             )
         except Exception:
             logger.exception("Scoring failed for %s in %s", task_key, scores_file)

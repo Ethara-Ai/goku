@@ -8,9 +8,11 @@ Implements 2 rubric types that require LLM judgement:
 
 from __future__ import annotations
 
+import base64
 import json
 import logging
 import os
+from pathlib import Path
 
 import litellm
 
@@ -21,12 +23,67 @@ logger = logging.getLogger(__name__)
 
 LLM_JUDGE_TYPES = frozenset({"response_criteria", "response_not_criteria"})
 
+# Supported image extensions for the multimodal judge payload. Non-image
+# inputs (PDF, MP4, etc.) are skipped — the judge has no way to handle them
+# via the OpenAI-style image_url block, and silently passing them would fail
+# the Bedrock converse call entirely.
+_IMAGE_MIME_BY_SUFFIX = {
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".gif": "image/gif",
+    ".webp": "image/webp",
+}
+
+# Safety caps. Bedrock converse accepts up to ~20 images per request and a
+# few MB per image; we stay well under both. Per-image cap is also a defense
+# against accidentally encoding huge agent-output PNGs.
+_MAX_IMAGES_PER_CALL = 8
+_MAX_IMAGE_BYTES = 4_000_000  # 4 MB
+
+
+def _build_image_blocks(paths: list[str] | list[Path] | None) -> list[dict]:
+    """Convert a list of image paths into OpenAI-style image_url content blocks.
+
+    Silently skips: non-existent files, non-image extensions, oversized
+    files. Returns at most ``_MAX_IMAGES_PER_CALL`` blocks. Empty input or
+    no usable images yields ``[]`` (caller falls back to text-only payload).
+    """
+    if not paths:
+        return []
+    blocks: list[dict] = []
+    for p in paths:
+        if len(blocks) >= _MAX_IMAGES_PER_CALL:
+            logger.info(
+                "Judge image cap reached (%d); skipping remaining inputs",
+                _MAX_IMAGES_PER_CALL,
+            )
+            break
+        path = Path(p)
+        if not path.is_file():
+            continue
+        mime = _IMAGE_MIME_BY_SUFFIX.get(path.suffix.lower())
+        if mime is None:
+            continue  # PDFs, videos, etc. — not multimodal-judgeable here
+        if path.stat().st_size > _MAX_IMAGE_BYTES:
+            logger.warning(
+                "Judge skipping oversized image %s (%d bytes > %d)",
+                path.name, path.stat().st_size, _MAX_IMAGE_BYTES,
+            )
+            continue
+        b64 = base64.b64encode(path.read_bytes()).decode("ascii")
+        blocks.append({
+            "type": "image_url",
+            "image_url": {"url": f"data:{mime};base64,{b64}"},
+        })
+    return blocks
+
 # Prompt template for response_criteria
 CRITERIA_PROMPT = """You are an evaluation judge for an AI agent benchmark.
 
 ## Task
 Determine whether the following criterion is satisfied by the agent's output.
-
+{image_note}
 ## Criterion
 {criterion}
 
@@ -41,7 +98,7 @@ Determine whether the following criterion is satisfied by the agent's output.
 
 ## Instructions
 - Evaluate ONLY whether the criterion above is met
-- Consider both the text response AND any output files
+- Consider the attached input image(s) (if any), the text response, AND any output files
 - The trajectory is provided for context only — do NOT evaluate the process, only the outcome
 - Be strict: the criterion must be clearly and fully satisfied
 
@@ -55,7 +112,7 @@ NOT_CRITERIA_PROMPT = """You are an evaluation judge for an AI agent benchmark.
 ## Task
 Determine whether the following NEGATIVE criterion is present in the agent's output.
 If present, the agent has hallucinated or produced incorrect information.
-
+{image_note}
 ## Negative Criterion (hallucination indicator)
 {criterion}
 
@@ -70,13 +127,23 @@ If present, the agent has hallucinated or produced incorrect information.
 
 ## Instructions
 - Check if the agent's output contains the described hallucination or error
+- Compare the agent's claims AGAINST the attached input image(s) (if any) to verify what is actually visible
 - "criteria_met": true means the hallucination IS present (BAD — penalty applies)
 - "criteria_met": false means the hallucination is NOT present (GOOD — no penalty)
-- Be thorough: check both text response and output files
+- Be thorough: check the text response, output files, AND the attached image(s)
 
 ## Required Output Format (JSON only, no other text)
 {{"criteria_met": true/false, "reasoning": "brief explanation"}}
 """
+
+_IMAGE_NOTE_WITH = (
+    "\nThe task's input image(s) are attached to this message as content "
+    "blocks. Use them to ground every visual claim — do not rely solely on "
+    "the agent's textual description.\n"
+)
+_IMAGE_NOTE_WITHOUT = (
+    "\n(This task has no input images — judge using only the text inputs below.)\n"
+)
 
 
 def score_llm_judge(
@@ -88,6 +155,7 @@ def score_llm_judge(
     judge_api_key: str | None = None,
     judge_base_url: str | None = None,
     aws_region_name: str | None = None,
+    input_image_paths: list[str] | list[Path] | None = None,
 ) -> ScorerResult:
     """Score a rubric item using an LLM judge.
 
@@ -101,6 +169,11 @@ def score_llm_judge(
             For Bedrock models, this is treated as AWS bearer token.
         judge_base_url: Optional base URL override for the judge model.
         aws_region_name: Optional AWS region for Bedrock models.
+        input_image_paths: Optional list of task input image paths. When
+            present, each image is base64-encoded and attached as an
+            image_url content block so the judge can ground visual claims
+            against the actual fixture (instead of bluffing about images
+            it has never seen). Non-image paths are silently skipped.
 
     Returns:
         A ScorerResult with pass/fail based on LLM judgement.
@@ -120,13 +193,32 @@ def score_llm_judge(
     else:
         prompt_template = NOT_CRITERIA_PROMPT
 
+    # Resolve image attachments first so we can tell the prompt whether
+    # images are present. We do this BEFORE formatting so the prompt's
+    # `{image_note}` accurately reflects what the judge actually receives.
+    image_blocks = _build_image_blocks(input_image_paths)
+    image_note = _IMAGE_NOTE_WITH if image_blocks else _IMAGE_NOTE_WITHOUT
+
     # Build the prompt
     prompt = prompt_template.format(
+        image_note=image_note,
         criterion=item.criterion,
         response=response[:32000],
         file_contents=file_contents[:32000],
         trajectory=trajectory[:16000],
     )
+
+    # Construct the message content. If we have images, use a multimodal
+    # content array (text block + N image_url blocks). Otherwise fall back
+    # to the historical text-only shape so providers that don't accept
+    # multimodal don't regress.
+    if image_blocks:
+        message_content: str | list[dict] = [
+            {"type": "text", "text": prompt},
+            *image_blocks,
+        ]
+    else:
+        message_content = prompt
 
     # Call LLM judge
     raw_content = ""
@@ -134,7 +226,7 @@ def score_llm_judge(
     try:
         completion_kwargs: dict = {
             "model": judge_model,
-            "messages": [{"role": "user", "content": prompt}],
+            "messages": [{"role": "user", "content": message_content}],
             "temperature": 0.0,
             "max_tokens": 512,
             "response_format": {"type": "json_object"},

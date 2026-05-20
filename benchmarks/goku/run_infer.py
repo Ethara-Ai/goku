@@ -482,6 +482,13 @@ class GokuEvaluation(Evaluation):
                     judge_model=judge_model,
                     judge_api_key=judge_api_key,
                     aws_region_name=judge_region,
+                    # Attach the task's input image(s) so the judge can
+                    # verify visual claims against the actual fixture
+                    # instead of bluffing about images it has never seen.
+                    # The agent already received these in run_infer's
+                    # initial message (see _image_to_base64_url above) —
+                    # this just gives the judge the same grounding.
+                    input_image_paths=instance.data.get("input_files") or [],
                 )
             else:
                 raise ValueError(
