@@ -22,6 +22,8 @@ from typing import List, Sequence
 from dotenv import load_dotenv
 
 from benchmarks.goku.config import INFER_DEFAULTS
+from benchmarks.goku.media_adapters import detect_provider, supports_native_pdf
+from benchmarks.goku.media_render import video_to_keyframes
 from benchmarks.goku.models import RubricItem
 from benchmarks.goku.scorers.deterministic import (
     DETERMINISTIC_TYPES,
@@ -308,11 +310,68 @@ class GokuEvaluation(Evaluation):
 
             # Resize oversized images before upload so the agent-server doesn't
             # hit Bedrock's 8000px dimension limit when re-sending to the model.
-            actual_path = _resize_if_needed(file_path)
-            resized = actual_path != file_path
+            # IMPORTANT: only do this for actual image files. PIL.Image.open()
+            # raises ``cannot identify image file`` on PDFs, videos, etc., which
+            # before this guard surfaced as a ``failure_category=resource``
+            # retry loop on every video-input task.
+            image_exts = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"}
+            if Path(file_path).suffix.lower() in image_exts:
+                actual_path = _resize_if_needed(file_path)
+                resized = actual_path != file_path
+            else:
+                actual_path = file_path
+                resized = False
 
             upload_ok = False
+
+            # Fast path: if the workspace is backed by a local Docker
+            # container we can use `docker cp` directly. This bypasses the
+            # agent-server's /api/file/upload endpoint entirely, which has
+            # been observed to 500 silently on files >100 MB and leave
+            # partial-byte garbage in /workspace. `docker cp` is a native
+            # filesystem copy through the Docker daemon — fast (~50 MB/s)
+            # and reliable for arbitrary file sizes.
+            container_id = getattr(workspace, "_container_id", None)
+            if container_id:
+                import subprocess as _subprocess
+                logger.info(
+                    f"Uploading {file_name} via docker cp ({os.path.getsize(actual_path):,} bytes) "
+                    f"to container {container_id[:12]}"
+                )
+                cp_result = _subprocess.run(
+                    ["docker", "cp", actual_path, f"{container_id}:/workspace/{file_name}"],
+                    capture_output=True, text=True, timeout=600,
+                )
+                if cp_result.returncode == 0:
+                    # Sanity check the size landed correctly.
+                    expected_size = os.path.getsize(actual_path)
+                    chk = workspace.execute_command(
+                        f"stat -c %s /workspace/{file_name} 2>/dev/null || echo 0",
+                        timeout=10.0,
+                    )
+                    actual_size = int(
+                        (getattr(chk, "stdout", "") or "0").strip() or 0
+                    )
+                    if actual_size == expected_size:
+                        upload_ok = True
+                        logger.info(
+                            f"Successfully uploaded {file_name} via docker cp "
+                            f"({actual_size:,} bytes)"
+                        )
+                    else:
+                        logger.warning(
+                            f"docker cp wrote {actual_size} bytes but expected "
+                            f"{expected_size} bytes — falling back to SDK"
+                        )
+                else:
+                    logger.warning(
+                        f"docker cp failed (exit {cp_result.returncode}): "
+                        f"{cp_result.stderr[:300]}"
+                    )
+
             for attempt in range(2):
+                if upload_ok:
+                    break
                 upload_result = workspace.file_upload(
                     actual_path, f"/workspace/{file_name}"
                 )
@@ -329,13 +388,20 @@ class GokuEvaluation(Evaluation):
                 with open(actual_path, "rb") as f:
                     encoded = base64.b64encode(f.read()).decode("ascii")
 
-                chunk_size = 65536  # avoid bash ARG_MAX limits
+                # 256 KB chunks. The previous 64 KB was unnecessarily small
+                # (HTTP+Docker overhead dominated, giving ~50 min upload time
+                # for a 282 MB file); 1 MB caused silent failures (the
+                # agent-server's execute_command has a tighter command-size
+                # limit than bash's ARG_MAX). 256 KB is the empirical sweet
+                # spot — ~4× faster than 64 KB, well under the silent-fail
+                # threshold.
+                chunk_size = 256 * 1024
                 first = True
                 for i in range(0, len(encoded), chunk_size):
                     chunk = encoded[i : i + chunk_size]
                     operator = ">" if first else ">>"
                     cmd = f"echo -n '{chunk}' {operator} /tmp/{file_name}.b64"
-                    workspace.execute_command(cmd, timeout=30.0)
+                    workspace.execute_command(cmd, timeout=60.0)
                     first = False
 
                 decode_cmd = (
@@ -369,14 +435,38 @@ class GokuEvaluation(Evaluation):
         instruction: str = instance.data["instruction"]
         input_files: list[str] = instance.data.get("input_files", [])
 
-        # Collect image URLs for multimodal message
+        # Build per-media-type content blocks for the initial multimodal turn.
+        #   * Images → existing ImageContent path (provider-universal).
+        #   * PDFs   → DocumentContent (native per-provider block — SDK extended
+        #              via benchmarks.utils.sdk_patches at sitecustomize time).
+        #   * Videos → ffmpeg-extracted keyframes treated as additional images.
+        #              Done uniformly across all 3 agent providers; only Gemini
+        #              would accept native video and the symmetry matters more
+        #              than the marginal fidelity gain.
+        #   * Other  → uploaded to workspace earlier; agent can shell-read.
         image_urls: list[str] = []
+        pdf_paths: list[str] = []
         for file_path in input_files:
             if not os.path.exists(file_path):
                 continue
-            extension = file_path.rsplit(".", 1)[-1].lower() if "." in file_path else ""
-            if extension in ("jpg", "jpeg", "png", "gif", "webp", "bmp"):
+            ext = file_path.rsplit(".", 1)[-1].lower() if "." in file_path else ""
+            if ext in ("jpg", "jpeg", "png", "gif", "webp", "bmp"):
                 image_urls.append(_image_to_base64_url(file_path))
+            elif ext == "pdf":
+                pdf_paths.append(file_path)
+            elif ext in ("mp4", "mov", "webm", "avi", "mkv"):
+                try:
+                    frames = video_to_keyframes(file_path, n_frames=8)
+                except Exception as exc:
+                    logger.warning(
+                        "Could not extract keyframes from %s: %s. Agent can "
+                        "still tool-read the file from /workspace.",
+                        file_path, exc,
+                    )
+                    continue
+                for frame in frames:
+                    image_urls.append(_image_to_base64_url(str(frame)))
+            # Anything else: leave to workspace upload — agent reads via tools.
 
         # Create agent
         agent_llm = build_eval_llm(self.metadata.llm)
@@ -397,17 +487,54 @@ class GokuEvaluation(Evaluation):
         )
 
         # Send multimodal message
+        content_blocks: list = [TextContent(text=instruction)]
         if image_urls:
-            msg = Message(
-                role="user",
-                content=[
-                    TextContent(text=instruction),
-                    ImageContent(image_urls=image_urls),
-                ],
-            )
-            conversation.send_message(msg)
-        else:
+            content_blocks.append(ImageContent(image_urls=image_urls))
+        if pdf_paths:
+            # Native PDF per agent provider — SDK extended at sitecustomize.
+            # Falls back to rendering pages to images if (a) the SDK patch
+            # didn't apply or (b) the provider doesn't support native PDF
+            # (today: Kimi via Bedrock — but Kimi isn't an agent model).
+            from benchmarks.utils import sdk_patches
+            agent_model_str = self.metadata.llm.model
+            # Many Bedrock configs use opaque application-inference-profile
+            # ARNs as the model string — the real family is on
+            # `model_canonical_name`. Pass both to detect_provider.
+            canonical = getattr(self.metadata.llm, "model_canonical_name", None)
+            if sdk_patches.is_applied() and supports_native_pdf(agent_model_str, canonical):
+                provider = detect_provider(agent_model_str, canonical)
+                provider_hint = "anthropic" if provider == "bedrock_anthropic" else "openai"
+                # 'gemini' uses the same openai-style file block, so it maps to "openai".
+                DocumentContent = sdk_patches.DocumentContent
+                for pdf in pdf_paths:
+                    content_blocks.append(
+                        DocumentContent(pdf_path=pdf, provider_hint=provider_hint)
+                    )
+            else:
+                # Fallback: render PDF pages to images, attach via ImageContent.
+                from benchmarks.goku.media_render import pdf_to_page_images
+                logger.info(
+                    "Native PDF unavailable for %s (canonical=%s) — rendering pages to images",
+                    agent_model_str, canonical,
+                )
+                rendered_urls: list[str] = []
+                for pdf in pdf_paths:
+                    try:
+                        pages = pdf_to_page_images(pdf, dpi=200)
+                    except Exception as exc:
+                        logger.warning("PDF render failed for %s: %s", pdf, exc)
+                        continue
+                    for page in pages:
+                        rendered_urls.append(_image_to_base64_url(str(page)))
+                if rendered_urls:
+                    content_blocks.append(ImageContent(image_urls=rendered_urls))
+
+        if len(content_blocks) == 1:
+            # Only the text — no media. Use the string shortcut.
             conversation.send_message(instruction)
+        else:
+            msg = Message(role="user", content=content_blocks)
+            conversation.send_message(msg)
 
         # Run conversation
         run_conversation_with_fake_user_response(conversation)
@@ -422,8 +549,11 @@ class GokuEvaluation(Evaluation):
         ]
         output_dir = self._download_outputs(workspace, instance.id, input_file_names)
 
-        # Collect file contents for LLM judge context
-        file_contents = self._collect_file_contents(output_dir)
+        # Collect file contents for LLM judge context. The second return is
+        # the list of agent-produced media files (images/PDFs/videos) so the
+        # judge can natively inspect them — pre-fix, these were attached as
+        # opaque "(binary, N bytes)" placeholders and the judge had to guess.
+        file_contents, output_media_paths = self._collect_file_contents(output_dir)
 
         # Collect trajectory for LLM judge context
         trajectory = self._format_trajectory(events)
@@ -482,13 +612,19 @@ class GokuEvaluation(Evaluation):
                     judge_model=judge_model,
                     judge_api_key=judge_api_key,
                     aws_region_name=judge_region,
-                    # Attach the task's input image(s) so the judge can
-                    # verify visual claims against the actual fixture
-                    # instead of bluffing about images it has never seen.
-                    # The agent already received these in run_infer's
-                    # initial message (see _image_to_base64_url above) —
-                    # this just gives the judge the same grounding.
+                    # The task's INPUT media (what the agent was given to
+                    # work with). Used for hallucination rubrics ("did the
+                    # agent assert something not visible in the input?")
+                    # and grounding ("does the agent's claim match the
+                    # input image?").
                     input_image_paths=instance.data.get("input_files") or [],
+                    # The agent's OUTPUT media (what the agent produced).
+                    # Used for output-correctness rubrics ("does the
+                    # agent's saved PDF contain the required sections?",
+                    # "does the saved image preserve the input features?").
+                    # Pre-fix the judge only saw "(binary, N bytes)"
+                    # placeholders and had to bluff.
+                    output_media_paths=output_media_paths,
                 )
             else:
                 raise ValueError(
@@ -641,25 +777,66 @@ class GokuEvaluation(Evaluation):
         except Exception as e:
             logger.warning(f"Base64 download failed for {remote_path}: {e}")
 
-    def _collect_file_contents(self, output_dir: Path) -> str:
-        """Read output files and return them as a formatted string for LLM judge."""
-        contents: list[str] = []
-        if not output_dir.exists():
-            return "(no output files)"
+    def _collect_file_contents(
+        self, output_dir: Path
+    ) -> tuple[str, list[str]]:
+        """Read output files for the LLM judge.
 
+        Returns:
+            ``(text_summary, output_media_paths)``:
+              * ``text_summary`` — concatenated text content for all
+                text-readable files (JSON, MD, code, etc.). Binary files
+                show up as ``--- name --- (binary, N bytes)`` placeholders.
+              * ``output_media_paths`` — absolute paths to image / PDF /
+                video files the agent produced. The judge can natively
+                inspect these via the per-provider routing in
+                :mod:`benchmarks.goku.scorers.llm_judge`.
+
+        Before this returned only the text_summary, so agent-produced
+        images/PDFs/videos showed up as opaque "(binary, N bytes)" lines
+        and the judge had to bluff about their content. Now they reach
+        the judge as multimodal content blocks.
+        """
+        contents: list[str] = []
+        media_paths: list[str] = []
+        if not output_dir.exists():
+            return "(no output files)", media_paths
+
+        media_suffixes = {
+            ".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp",   # images
+            ".pdf",                                              # PDFs
+            ".mp4", ".mov", ".webm", ".avi", ".mkv",            # videos
+        }
         for f in sorted(output_dir.rglob("*")):
             if not f.is_file():
                 continue
+
+            suffix = f.suffix.lower()
+            if suffix in media_suffixes:
+                # Note in the text summary so the judge knows the file
+                # exists, then list it as a media path for native attach.
+                contents.append(
+                    f"--- {f.name} --- (attached as output media; "
+                    f"{f.stat().st_size:,} bytes)"
+                )
+                media_paths.append(str(f.resolve()))
+                continue
+
             if f.stat().st_size > 50_000:
-                contents.append(f"--- {f.name} --- (binary, {f.stat().st_size} bytes)")
+                contents.append(
+                    f"--- {f.name} --- (binary, {f.stat().st_size} bytes)"
+                )
                 continue
             try:
                 text = f.read_text(encoding="utf-8")
                 contents.append(f"--- {f.name} ---\n{text[:20000]}")
             except UnicodeDecodeError:
-                contents.append(f"--- {f.name} --- (binary, {f.stat().st_size} bytes)")
+                contents.append(
+                    f"--- {f.name} --- (binary, {f.stat().st_size} bytes)"
+                )
 
-        return "\n\n".join(contents) if contents else "(no output files)"
+        text_summary = "\n\n".join(contents) if contents else "(no output files)"
+        return text_summary, media_paths
 
     def _format_trajectory(self, events: Sequence[Event]) -> str:
         """Format conversation events as trajectory string for LLM judge context."""

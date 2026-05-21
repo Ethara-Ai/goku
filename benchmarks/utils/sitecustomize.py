@@ -18,7 +18,7 @@ so no extra wiring is needed.
 
 from __future__ import annotations
 
-from benchmarks.utils import httpx_patches, modal_patches
+from benchmarks.utils import httpx_patches, modal_patches, sdk_patches
 
 
 def _apply_modal_logging_patch() -> None:
@@ -31,3 +31,8 @@ _apply_modal_logging_patch()
 # to this repo's processes only; the vendored SDK submodule stays pristine
 # so sibling benchmarks pinning the same submodule are unaffected.
 httpx_patches.apply()
+# Extend the SDK Message type with DocumentContent so the agent can receive
+# native PDF input blocks (Anthropic 'document' / OpenAI 'file' shapes
+# per-provider). Same isolation reasoning as httpx_patches — runtime
+# extension only, vendor submodule unchanged.
+sdk_patches.apply()

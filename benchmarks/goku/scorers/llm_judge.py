@@ -16,6 +16,8 @@ from pathlib import Path
 
 import litellm
 
+from benchmarks.goku.media_adapters import detect_provider, supports_native_pdf
+from benchmarks.goku.media_render import pdf_to_page_images, video_to_keyframes
 from benchmarks.goku.models import RubricItem, ScorerResult
 
 
@@ -23,10 +25,7 @@ logger = logging.getLogger(__name__)
 
 LLM_JUDGE_TYPES = frozenset({"response_criteria", "response_not_criteria"})
 
-# Supported image extensions for the multimodal judge payload. Non-image
-# inputs (PDF, MP4, etc.) are skipped — the judge has no way to handle them
-# via the OpenAI-style image_url block, and silently passing them would fail
-# the Bedrock converse call entirely.
+# Supported media types for the multimodal judge payload.
 _IMAGE_MIME_BY_SUFFIX = {
     ".png": "image/png",
     ".jpg": "image/jpeg",
@@ -34,115 +33,250 @@ _IMAGE_MIME_BY_SUFFIX = {
     ".gif": "image/gif",
     ".webp": "image/webp",
 }
+_PDF_SUFFIXES = {".pdf"}
+_VIDEO_SUFFIXES = {".mp4", ".mov", ".webm", ".avi", ".mkv"}
 
 # Safety caps. Bedrock converse accepts up to ~20 images per request and a
 # few MB per image; we stay well under both. Per-image cap is also a defense
 # against accidentally encoding huge agent-output PNGs.
-_MAX_IMAGES_PER_CALL = 8
-_MAX_IMAGE_BYTES = 4_000_000  # 4 MB
+_MAX_MEDIA_PER_CALL = 20
+_MAX_IMAGE_BYTES = 4_000_000   # 4 MB
+_MAX_PDF_BYTES = 30_000_000    # 30 MB (Anthropic limit is 32 MB)
+_KEYFRAMES_PER_VIDEO = 8       # mirrors run_infer.py agent path
 
 
-def _build_image_blocks(paths: list[str] | list[Path] | None) -> list[dict]:
-    """Convert a list of image paths into OpenAI-style image_url content blocks.
+def _image_url_block(path: Path) -> dict:
+    """Encode an image file as an OpenAI-style image_url content block."""
+    mime = _IMAGE_MIME_BY_SUFFIX.get(path.suffix.lower(), "image/png")
+    b64 = base64.b64encode(path.read_bytes()).decode("ascii")
+    return {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64}"}}
 
-    Silently skips: non-existent files, non-image extensions, oversized
-    files. Returns at most ``_MAX_IMAGES_PER_CALL`` blocks. Empty input or
-    no usable images yields ``[]`` (caller falls back to text-only payload).
+
+def _build_media_blocks(
+    paths: list[str] | list[Path] | None,
+    *,
+    judge_model: str = "",
+    judge_canonical: str | None = None,
+) -> tuple[list[dict], list[str]]:
+    """Convert task input media paths into content blocks for the judge.
+
+    Per-provider routing (mirrors the agent path in ``run_infer.py``):
+
+      * Images (PNG/JPG/JPEG/GIF/WEBP) → ``image_url`` block (every provider).
+      * PDFs:
+          - Anthropic / Claude on Bedrock → native ``document`` block.
+          - OpenAI / Gemini               → native ``file`` block.
+          - Kimi via Bedrock (and any unknown) → render pages via pypdfium2
+            and attach each page as an ``image_url`` block. This is the
+            "ffmpeg/pypdfium2 fallback" the operator turns on by leaving the
+            judge as Kimi.
+      * Videos (MP4/MOV/WEBM/AVI/MKV) → uniformly extract keyframes via
+        ffmpeg and attach as ``image_url`` blocks. Matches the agent path's
+        uniform-ffmpeg decision so the judge sees what the agent saw.
+
+    Returns:
+        (blocks, warnings) — ``blocks`` is spliced into the message;
+        ``warnings`` is appended to the judge's rationale so any silent
+        drop (oversized file, render failure) is visible downstream.
     """
-    if not paths:
-        return []
     blocks: list[dict] = []
-    for p in paths:
-        if len(blocks) >= _MAX_IMAGES_PER_CALL:
-            logger.info(
-                "Judge image cap reached (%d); skipping remaining inputs",
-                _MAX_IMAGES_PER_CALL,
+    warnings: list[str] = []
+    if not paths:
+        return blocks, warnings
+
+    provider = detect_provider(judge_model, judge_canonical)
+    pdf_native = supports_native_pdf(judge_model, judge_canonical)
+
+    def _cap_reached() -> bool:
+        if len(blocks) >= _MAX_MEDIA_PER_CALL:
+            msg = (
+                f"judge media cap reached ({_MAX_MEDIA_PER_CALL}); "
+                f"remaining inputs skipped"
             )
+            logger.info(msg)
+            warnings.append(msg)
+            return True
+        return False
+
+    for p in paths:
+        if _cap_reached():
             break
+
         path = Path(p)
         if not path.is_file():
             continue
-        mime = _IMAGE_MIME_BY_SUFFIX.get(path.suffix.lower())
-        if mime is None:
-            continue  # PDFs, videos, etc. — not multimodal-judgeable here
-        if path.stat().st_size > _MAX_IMAGE_BYTES:
-            logger.warning(
-                "Judge skipping oversized image %s (%d bytes > %d)",
-                path.name, path.stat().st_size, _MAX_IMAGE_BYTES,
-            )
+        suffix = path.suffix.lower()
+        size = path.stat().st_size
+
+        # --- Images ---
+        if suffix in _IMAGE_MIME_BY_SUFFIX:
+            if size > _MAX_IMAGE_BYTES:
+                msg = f"image {path.name} too large ({size} bytes) — skipping"
+                logger.warning(msg)
+                warnings.append(msg)
+                continue
+            blocks.append(_image_url_block(path))
             continue
-        b64 = base64.b64encode(path.read_bytes()).decode("ascii")
-        blocks.append({
-            "type": "image_url",
-            "image_url": {"url": f"data:{mime};base64,{b64}"},
-        })
-    return blocks
+
+        # --- PDFs ---
+        if suffix in _PDF_SUFFIXES:
+            if size > _MAX_PDF_BYTES:
+                msg = f"PDF {path.name} too large ({size} bytes) — skipping"
+                logger.warning(msg)
+                warnings.append(msg)
+                continue
+            if pdf_native:
+                b64 = base64.b64encode(path.read_bytes()).decode("ascii")
+                if provider == "bedrock_anthropic":
+                    blocks.append({
+                        "type": "document",
+                        "source": {
+                            "type": "base64",
+                            "media_type": "application/pdf",
+                            "data": b64,
+                        },
+                    })
+                else:  # openai / gemini
+                    blocks.append({
+                        "type": "file",
+                        "file": {
+                            "filename": path.name,
+                            "file_data": f"data:application/pdf;base64,{b64}",
+                        },
+                    })
+            else:
+                # Kimi-on-Bedrock or unknown — render pages to images.
+                try:
+                    pages = pdf_to_page_images(path, dpi=200)
+                except Exception as exc:
+                    msg = f"PDF render failed for {path.name}: {exc}"
+                    logger.warning(msg)
+                    warnings.append(msg)
+                    continue
+                for page in pages:
+                    if _cap_reached():
+                        break
+                    blocks.append(_image_url_block(page))
+            continue
+
+        # --- Videos ---
+        if suffix in _VIDEO_SUFFIXES:
+            # Uniform ffmpeg approach: extract keyframes and attach as images.
+            # Matches run_infer.py agent path so the judge sees the same
+            # representation as the agent — clean apples-to-apples scoring.
+            try:
+                frames = video_to_keyframes(path, n_frames=_KEYFRAMES_PER_VIDEO)
+            except Exception as exc:
+                msg = f"video keyframe extract failed for {path.name}: {exc}"
+                logger.warning(msg)
+                warnings.append(msg)
+                continue
+            for frame in frames:
+                if _cap_reached():
+                    break
+                blocks.append(_image_url_block(frame))
+            continue
+
+        # --- Anything else (unknown extension) ---
+        msg = (
+            f"input file {path.name} has no supported judge encoding "
+            f"(extension {suffix!r}); skipping"
+        )
+        logger.info(msg)
+        warnings.append(msg)
+
+    return blocks, warnings
 
 # Prompt template for response_criteria
+# CRITICAL: the prompt MUST distinguish INPUT media (task fixture) from
+# OUTPUT media (agent's work product). Conflating them leads to wrong
+# verdicts on rubrics like "did the agent's output PDF correctly summarize
+# the input image?" — the judge needs to look at the output PDF for the
+# summary AND compare against the input image for correctness.
 CRITERIA_PROMPT = """You are an evaluation judge for an AI agent benchmark.
 
 ## Task
 Determine whether the following criterion is satisfied by the agent's output.
-{image_note}
+{media_note}
 ## Criterion
 {criterion}
 
-## Agent Response
+## Agent Text Response
 {response}
 
-## Agent Output Files
+## Agent Output Files (text-readable)
 {file_contents}
 
 ## Agent Trajectory (for context)
 {trajectory}
 
 ## Instructions
-- Evaluate ONLY whether the criterion above is met
-- Consider the attached input image(s) (if any), the text response, AND any output files
-- The trajectory is provided for context only — do NOT evaluate the process, only the outcome
-- Be strict: the criterion must be clearly and fully satisfied
+- Evaluate ONLY whether the criterion above is met.
+- If the criterion is about what the AGENT PRODUCED (e.g. "the saved PDF
+  contains a Conclusion section"), look at the OUTPUT media attachments.
+- If the criterion is about what was in the TASK (e.g. "the agent
+  identified all items visible in the photo"), look at the INPUT media
+  attachments and compare against the agent's text response / output files.
+- If the criterion involves both (e.g. "the agent's output image preserves
+  features from the input image"), compare INPUT and OUTPUT side-by-side.
+- The trajectory is provided for context only — do NOT evaluate the process,
+  only the outcome.
+- Be strict: the criterion must be clearly and fully satisfied.
 
 ## Required Output Format (JSON only, no other text)
-{{"criteria_met": true/false, "reasoning": "brief explanation"}}
+{{"criteria_met": true/false, "reasoning": "brief explanation citing which media (INPUT or OUTPUT) you relied on"}}
 """
 
 # Prompt template for response_not_criteria (hallucination detection)
 NOT_CRITERIA_PROMPT = """You are an evaluation judge for an AI agent benchmark.
 
 ## Task
-Determine whether the following NEGATIVE criterion is present in the agent's output.
-If present, the agent has hallucinated or produced incorrect information.
-{image_note}
+Determine whether the following NEGATIVE criterion (hallucination indicator)
+is present in the agent's output.
+{media_note}
 ## Negative Criterion (hallucination indicator)
 {criterion}
 
-## Agent Response
+## Agent Text Response
 {response}
 
-## Agent Output Files
+## Agent Output Files (text-readable)
 {file_contents}
 
 ## Agent Trajectory (for context)
 {trajectory}
 
 ## Instructions
-- Check if the agent's output contains the described hallucination or error
-- Compare the agent's claims AGAINST the attached input image(s) (if any) to verify what is actually visible
-- "criteria_met": true means the hallucination IS present (BAD — penalty applies)
-- "criteria_met": false means the hallucination is NOT present (GOOD — no penalty)
-- Be thorough: check the text response, output files, AND the attached image(s)
+- A hallucination is an assertion the agent makes (in its text response OR
+  its output media) that does NOT appear in the INPUT media. Compare claims
+  against the INPUT media attachments specifically.
+- If the agent's OUTPUT media (e.g. a saved image) depicts something not
+  present in the INPUT media, that is also a hallucination.
+- "criteria_met": true means the hallucination IS present (BAD — penalty applies).
+- "criteria_met": false means the hallucination is NOT present (GOOD — no penalty).
+- A description that is INFERRED with appropriate hedging (e.g. "likely
+  electrified given the modern sleeve") is NOT a hallucination — only direct
+  factual claims about non-visible features qualify.
+- Be thorough: check the text response, the output files, AND every attached
+  INPUT media block before deciding.
 
 ## Required Output Format (JSON only, no other text)
-{{"criteria_met": true/false, "reasoning": "brief explanation"}}
+{{"criteria_met": true/false, "reasoning": "brief explanation citing which INPUT media you compared against"}}
 """
 
-_IMAGE_NOTE_WITH = (
-    "\nThe task's input image(s) are attached to this message as content "
-    "blocks. Use them to ground every visual claim — do not rely solely on "
-    "the agent's textual description.\n"
+# Single banner shown when ANY media is attached (input, output, or both).
+# Specific per-section labels ("=== INPUT MEDIA ===" / "=== OUTPUT MEDIA ===")
+# are inserted as separate text content blocks between the input and output
+# attachments — that's more reliable than relying on the model to remember
+# a banner instruction across many image blocks.
+_MEDIA_NOTE_WITH = (
+    "\nMedia attached to this message follows the text below. Sections are "
+    "delimited by '=== INPUT MEDIA ===' (the task fixture given to the agent) "
+    "and '=== OUTPUT MEDIA ===' (files the agent produced). Use each section "
+    "for the appropriate part of the criterion — do not conflate them.\n"
 )
-_IMAGE_NOTE_WITHOUT = (
-    "\n(This task has no input images — judge using only the text inputs below.)\n"
+_MEDIA_NOTE_WITHOUT = (
+    "\n(This task has no attached media — judge using only the text below.)\n"
 )
 
 
@@ -156,6 +290,8 @@ def score_llm_judge(
     judge_base_url: str | None = None,
     aws_region_name: str | None = None,
     input_image_paths: list[str] | list[Path] | None = None,
+    output_media_paths: list[str] | list[Path] | None = None,
+    judge_canonical_name: str | None = None,
 ) -> ScorerResult:
     """Score a rubric item using an LLM judge.
 
@@ -169,11 +305,19 @@ def score_llm_judge(
             For Bedrock models, this is treated as AWS bearer token.
         judge_base_url: Optional base URL override for the judge model.
         aws_region_name: Optional AWS region for Bedrock models.
-        input_image_paths: Optional list of task input image paths. When
-            present, each image is base64-encoded and attached as an
-            image_url content block so the judge can ground visual claims
-            against the actual fixture (instead of bluffing about images
-            it has never seen). Non-image paths are silently skipped.
+        input_image_paths: Optional list of TASK INPUT media paths (the
+            fixture given to the agent). Per-provider routing: native PDF
+            block where supported, ffmpeg keyframes for videos, image_url
+            blocks for images. Pre-fix the judge had no input grounding and
+            bluffed about visual claims.
+        output_media_paths: Optional list of AGENT OUTPUT media paths (files
+            the agent produced into its results/ directory). Attached with
+            the SAME per-provider routing — the judge can natively inspect
+            agent-produced PDFs/images/videos instead of seeing them as
+            opaque "(binary, N bytes)" placeholders.
+        judge_canonical_name: Optional canonical model name for Bedrock
+            opaque-ARN models. Lets the multimodal router pick the right
+            per-provider block shape.
 
     Returns:
         A ScorerResult with pass/fail based on LLM judgement.
@@ -193,30 +337,72 @@ def score_llm_judge(
     else:
         prompt_template = NOT_CRITERIA_PROMPT
 
-    # Resolve image attachments first so we can tell the prompt whether
-    # images are present. We do this BEFORE formatting so the prompt's
-    # `{image_note}` accurately reflects what the judge actually receives.
-    image_blocks = _build_image_blocks(input_image_paths)
-    image_note = _IMAGE_NOTE_WITH if image_blocks else _IMAGE_NOTE_WITHOUT
+    # Resolve media attachments first so the prompt's `{media_note}`
+    # accurately reflects what the judge actually receives. Two independent
+    # sections — INPUT media (task fixture) and OUTPUT media (agent's work
+    # product) — must be clearly labeled in the payload so the judge can't
+    # conflate them on rubrics that talk about both.
+    input_blocks, input_warnings = _build_media_blocks(
+        input_image_paths,
+        judge_model=judge_model,
+        judge_canonical=judge_canonical_name,
+    )
+    output_blocks, output_warnings = _build_media_blocks(
+        output_media_paths,
+        judge_model=judge_model,
+        judge_canonical=judge_canonical_name,
+    )
+    has_any_media = bool(input_blocks or output_blocks)
+    media_note = _MEDIA_NOTE_WITH if has_any_media else _MEDIA_NOTE_WITHOUT
+
+    # Re-label warnings so the operator can tell which section dropped a
+    # file (e.g. a corrupt OUTPUT video vs. an oversized INPUT image).
+    media_warnings = (
+        [f"INPUT: {w}" for w in input_warnings]
+        + [f"OUTPUT: {w}" for w in output_warnings]
+    )
 
     # Build the prompt
     prompt = prompt_template.format(
-        image_note=image_note,
+        media_note=media_note,
         criterion=item.criterion,
         response=response[:32000],
         file_contents=file_contents[:32000],
         trajectory=trajectory[:16000],
     )
 
-    # Construct the message content. If we have images, use a multimodal
-    # content array (text block + N image_url blocks). Otherwise fall back
-    # to the historical text-only shape so providers that don't accept
-    # multimodal don't regress.
-    if image_blocks:
-        message_content: str | list[dict] = [
-            {"type": "text", "text": prompt},
-            *image_blocks,
-        ]
+    # Construct the message content.
+    #
+    # When media is present, build a multimodal content array with explicit
+    # text delimiters between the INPUT and OUTPUT sections. The text
+    # delimiters live INSIDE the content list (as separate text blocks) so
+    # the judge sees them adjacent to the relevant image/document blocks —
+    # more reliable than relying on the model to remember a banner from the
+    # top of the message across many media blocks.
+    #
+    # When no media is present, fall back to the historical text-only shape
+    # so providers that don't accept multimodal don't regress.
+    if has_any_media:
+        message_parts: list[dict] = [{"type": "text", "text": prompt}]
+        if input_blocks:
+            message_parts.append({
+                "type": "text",
+                "text": (
+                    "\n=== INPUT MEDIA "
+                    "(the task fixture given to the agent) ===\n"
+                ),
+            })
+            message_parts.extend(input_blocks)
+        if output_blocks:
+            message_parts.append({
+                "type": "text",
+                "text": (
+                    "\n=== OUTPUT MEDIA "
+                    "(files the agent produced as its work product) ===\n"
+                ),
+            })
+            message_parts.extend(output_blocks)
+        message_content: str | list[dict] = message_parts
     else:
         message_content = prompt
 
@@ -300,6 +486,17 @@ def score_llm_judge(
     else:
         # Negative items: penalty deducted when criterion IS matched
         points_awarded = item.points if passed else 0
+
+    # If any media couldn't be routed to the judge, append a clearly-marked
+    # note to the rationale so operators can spot blind-spot verdicts in
+    # scores.jsonl. The judge's pass/fail stays whatever it returned —
+    # we only annotate so the gap is visible, not silent.
+    if media_warnings:
+        reasoning = (
+            reasoning
+            + "\n\n[JUDGE MEDIA WARNINGS — judge did NOT see the following:]\n  - "
+            + "\n  - ".join(media_warnings)
+        )
 
     return ScorerResult(
         number=item.number,

@@ -27,6 +27,12 @@ RubricCategory = Literal[
     "STYLE",
 ]
 
+# Task input media category. Each task is siloed: a `pdf` task may only ship
+# PDFs, `image` only images, `video` only videos. The loader enforces this
+# at task-discovery time so violations surface early. `mixed` is allowed for
+# legacy tasks shipped before the category split — new tasks should pick one.
+TaskCategory = Literal["pdf", "image", "video", "mixed"]
+
 
 class RubricItem(BaseModel):
     """A single rubric item from rubrics.jsonl."""
@@ -84,6 +90,13 @@ class GokuEvalInstance(BaseModel):
     rubric_items: list[RubricItem]
     input_files: list[str] = Field(
         default_factory=list, description="Absolute paths to input media files"
+    )
+    # Set by the loader from `task_category` in rubrics.jsonl header (or
+    # auto-inferred from input file extensions if absent). Drives per-category
+    # validation: pdf tasks may not ship video, etc.
+    task_category: TaskCategory = Field(
+        default="mixed",
+        description="Input media category: pdf | image | video | mixed (legacy).",
     )
 
 

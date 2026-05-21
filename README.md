@@ -27,6 +27,10 @@ file/shell checks + LLM-judged criteria).
 - **Python 3.12+**
 - **[uv](https://docs.astral.sh/uv/) ≥ 0.8.13** — Python package manager
 - **Docker** with the daemon running (the agent runs inside a sandbox container)
+- **`ffmpeg`** on `PATH` — required for tasks with video inputs. The harness
+  extracts evenly-spaced keyframes via `ffmpeg` so the agent and judge see
+  the video as a sequence of images. macOS: `brew install ffmpeg`; Debian/Ubuntu:
+  `apt install ffmpeg`. Skip if you don't author video-input tasks.
 - API credentials for whatever models you want to evaluate:
   - Anthropic / AWS Bedrock (for Claude)
   - OpenAI (for GPT)
@@ -42,7 +46,7 @@ file/shell checks + LLM-judged criteria).
 git clone <this-repo-url> goku
 cd goku
 make build          # syncs submodules, runs `uv sync --dev`, sets up pre-commit
-make test           # runs unit tests; should report 97 passed
+make test           # runs unit tests; should report 161 passed (goku module)
 ```
 
 ---
@@ -71,6 +75,7 @@ Because that ARN is ugly in directory names, you can add an optional
 {
   "model": "bedrock/converse/arn:aws:bedrock:...:application-inference-profile/abc123",
   "display_name": "claude-opus-4.7",
+  "model_canonical_name": "anthropic.claude-opus-4-7",
   "api_key": "..."
 }
 ```
@@ -78,6 +83,14 @@ Because that ARN is ugly in directory names, you can add an optional
 If omitted, the LLM config's **filename stem** is used (e.g.
 `.llm_config/claude-opus-4.7.json` → `claude-opus-4.7`). Falls back to
 `model.replace("/", "_")` only if neither is available.
+
+**`model_canonical_name`** (Bedrock-only, optional but recommended for
+multimodal tasks): the Bedrock application-inference-profile ARN is opaque —
+nothing in it identifies the underlying model family. The multimodal router
+consults `model_canonical_name` to pick the right per-provider PDF block
+shape (`anthropic.*` → `document` block; `openai.*` / `gemini.*` → `file`
+block; everything else → render PDF pages to images). If omitted, the
+router falls back to rendering — slightly lossier on dense text, but safe.
 
 `run_batch.sh` **auto-discovers** configs in `.llm_config/` and classifies them
 by the `model` field:
@@ -125,6 +138,92 @@ Two **hard rules** from the spec:
    instead.
 
 The loader **fails loudly** if it can't parse a task — no silent skips.
+
+---
+
+## Multimodal inputs (images, PDFs, videos)
+
+Any file dropped into a task's `data/input_files/` is uploaded to the agent's
+workspace **and** attached to the agent's initial multimodal turn. The agent
+*and* the judge both see the file — the same one — so visual rubrics
+(`response_not_criteria` hallucination checks especially) can be graded
+against ground truth, not against the agent's own description.
+
+Same multimodal pipeline applies to the agent's **OUTPUT** files: if the
+agent produces a PDF, image, or video into `/workspace/results/`, those
+files are attached to the judge under a separate `=== OUTPUT MEDIA ===`
+section block. Without this, output rubrics (e.g. "the agent's saved PDF
+contains a Conclusion section") could only be graded against the agent's
+text description of its own output — the judge would have to bluff.
+
+### Per-file routing
+
+| File type | Agent (Claude / GPT / Gemini) | Judge (Kimi by default) |
+|---|---|---|
+| **Image** (PNG/JPG/JPEG/GIF/WEBP) | Native `image_url` block | Native `image_url` block |
+| **PDF** | Native per provider: `document` block (Claude) / `file` block (GPT, Gemini) | If judge supports native PDF: native block. If not (Kimi-Bedrock): **rendered to page PNGs via `pypdfium2`** at 200 DPI and attached as images. |
+| **Video** (MP4/MOV/WEBM/AVI/MKV) | **Uniformly extracted to 60 keyframes via `ffmpeg`**, attached as images. Symmetric across all 3 agent models so video task scores stay comparable. | Same: 60 keyframes via `ffmpeg`. |
+| Other (CSV, JSON, MD, code, …) | Uploaded to `/workspace/` only — agent reads via shell/tool calls. | Not attached; judge sees the agent's text summary only. |
+
+### Task categories — strict siloing
+
+Tasks fall into one of three categories, declared via a `task_category` header
+line in `rubrics.jsonl` (the loader treats lines without a `number` field as
+header records):
+
+```jsonl
+{"task_category": "pdf"}
+{"number": 1, "type": "probe_file_exists", ...}
+{"number": 2, "type": "response_criteria", ...}
+```
+
+Allowed values: **`pdf`** | **`image`** | **`video`** | **`mixed`** (legacy
+only). A `pdf` task may only ship `.pdf` files in `data/input_files/`; an
+`image` task only image extensions; a `video` task only video extensions.
+Mixing categories within a single task is rejected at load time so the
+benchmarking comparison stays clean. If no header is present, the loader
+infers the category from extensions and downgrades violations to warnings
+(grandfathered legacy behavior).
+
+### Hard limits — per category (enforced at task load)
+
+| Category | Per-file | Files per task | Total payload |
+|---|---|---|---|
+| **PDF** | 100 pages, 30 MB | 1–3 PDFs | ≤ 40 MB |
+| **Image** | 5 MB per file, ≤ 4096×4096 px | up to 20 images | ≤ 40 MB |
+| **Video** | 60 min, 200 MB, 1080p | 1 video | ≤ 200 MB; 60 keyframes auto-extracted |
+
+These caps live in `benchmarks/goku/media_render.py` (`MAX_PDF_BYTES`,
+`MAX_VIDEO_BYTES`, `MAX_IMAGE_BYTES`, `MAX_VIDEO_DURATION_SEC`). The loader's
+`_validate_input_files_for_category` enforces them when a category is
+explicitly declared and warns when inferred.
+
+### Judge prompt — input vs output separation
+
+The judge's multimodal payload is built as a labeled content array:
+
+```
+[ text(prompt + instructions), 
+  text("=== INPUT MEDIA (the task fixture given to the agent) ==="),
+    image/document/keyframe blocks for the INPUT,
+  text("=== OUTPUT MEDIA (files the agent produced as its work product) ==="),
+    image/document/keyframe blocks for the OUTPUT ]
+```
+
+The prompt's instructions explicitly tell the judge to "look at INPUT media
+for grounding what was in the task, OUTPUT media for what the agent
+produced, and compare them side-by-side if the criterion spans both." A
+dedicated test suite (`TestInputOutputMediaSeparation` in
+`tests/test_llm_judge.py`) pins this invariant, and an empirical probe
+verified the Kimi judge cites the correct section in its rationale for
+output-correctness, input-grounding, and cross-media hallucination rubrics.
+
+### Bedrock opaque-ARN gotcha
+
+Bedrock application-inference-profile ARNs contain no provider markers, so
+add a `model_canonical_name` field to the LLM config
+(e.g. `"anthropic.claude-opus-4-7"`) so the multimodal router can pick the
+right per-provider block shape. See [`Configure LLMs`](#configure-llms).
 
 ---
 
@@ -345,6 +444,14 @@ Benchmark-level (across tasks):
 | `No instances to process` and the batch finishes in seconds | Harness resume-state is still holding the task as "done". Re-run `run_batch.sh --tasks <keys> --rerun` to strip `output.jsonl` + `output.critic_attempt_*.jsonl` entries before launching |
 | `BATCH FAILED — 0 of N tasks completed` (exit 2) | Either silent resume-state skip (use `--rerun`), Docker/Modal connectivity issues, or LLM-config credential rejection. Per-model logs are in `batch_logs/<batch_id>/` |
 | Delivery folder has no `response.md` in `results/` | Pre-`response.md`-feature delivery — backfill with `uv run goku-write-response-md <delivery_root> --eval-outputs-root eval_outputs` (see Re-scoring section) |
+| `ffmpeg not found on PATH` | Install ffmpeg (`brew install ffmpeg` on macOS, `apt install ffmpeg` on Debian). Required only for video-input tasks. |
+| `ModuleNotFoundError: pypdfium2` | Run `uv sync` to pull the dep (added for the multimodal-judge PDF fallback path). |
+| Judge rationale contains `[JUDGE MEDIA WARNINGS — judge did NOT see ...]` | A media file couldn't be attached to the judge (oversized, corrupt video, missing renderer). The note names the file — fix the source or raise the cap in `benchmarks/goku/scorers/llm_judge.py`. |
+| `This model doesn't support documents.` (Bedrock) | Judge model doesn't accept native PDFs (Kimi via Bedrock). Set `model_canonical_name` on the LLM config so the multimodal router selects the pypdfium2 fallback path instead of the native `document` block. |
+| Claude Opus 4.7 returns `temperature is deprecated` | Opus 4.7 rejects any non-default `temperature` / `top_p` / `top_k`. If using Claude as judge, omit the `"temperature"` field from the LLM config. |
+| `Task X: input_files violate per-category limits` | A task declares `task_category` in `rubrics.jsonl` but its files violate the cap (wrong extension, oversized, video too long). The error message names the file and the cap. Either fix the file or change/remove the `task_category` header. |
+| `Task X: invalid task_category 'foo'` | `task_category` must be one of `pdf` / `image` / `video` / `mixed`. Fix the header line. |
+| Legacy task loads with a WARNING about cap violations | Task has no `task_category` header, the loader inferred one from extensions, and a file exceeds the inferred-category cap. Either compress/downscale the file or add an explicit `task_category` header so the loader uses strict validation. |
 
 ---
 
@@ -353,20 +460,31 @@ Benchmark-level (across tasks):
 ```
 goku/
 ├── benchmarks/goku/                # the benchmark module
-│   ├── run_infer.py                # inference pipeline
+│   ├── run_infer.py                # inference pipeline (agent path)
 │   ├── eval_infer.py               # report + delivery export
+│   ├── rescore.py                  # re-judge existing trajectories (no agent re-run)
 │   ├── scoring.py                  # per-task score aggregation
 │   ├── task_loader.py              # dataset discovery + validation
 │   ├── models.py                   # pydantic schemas
 │   ├── config.py                   # model display-name lookup
+│   ├── media_render.py             # PDF→images (pypdfium2), video→keyframes (ffmpeg)
+│   ├── media_adapters.py           # per-provider PDF block routing
+│   ├── response_extractor.py       # final-response extraction for delivery
+│   ├── write_response_md.py        # backfill response.md on existing deliveries
 │   ├── scorers/
 │   │   ├── deterministic.py        # probe_*, shell_*, response_contains/regex
 │   │   └── llm_judge.py            # response_criteria, response_not_criteria
-│   └── tests/                      # 97 unit tests
+│   └── tests/                      # 161 unit tests
+├── benchmarks/utils/
+│   ├── sdk_patches.py              # runtime extension of OpenHands SDK Message
+│   │                               #   for native PDF content blocks
+│   ├── httpx_patches.py            # follow_redirects=True for SDK RemoteWorkspace
+│   └── sitecustomize.py            # applies sdk_patches + httpx_patches at startup
+├── vendor/software-agent-sdk/      # OpenHands SDK as a git submodule (untouched)
 ├── dataset/                        # YOUR tasks go here
 ├── sample_tasks/task_template/     # working example to copy
 ├── .llm_config/                    # YOUR LLM config JSONs
-├── eval_outputs/              # raw inference outputs (created on run)
+├── eval_outputs/                   # raw inference outputs (created on run)
 ├── delivery/                       # packaged delivery folder (created on export)
 ├── run_batch.sh                    # batch runner
 ├── Makefile                        # build, format, lint, test, clean

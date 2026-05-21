@@ -10,6 +10,11 @@ dependencies = [
     "jinja2",
     "pandas",
     "Pillow",
+    # PDF rendering — used by benchmarks.goku.media_render.pdf_to_page_images()
+    # for the multimodal-judge fallback (Kimi via Bedrock can't see native PDFs,
+    # so we render each page to a PNG and attach as image_url blocks). Pure-
+    # Python wheel, no system deps.
+    "pypdfium2>=4.30.0",
     "toml",
     "tqdm",
     "openhands-sdk",

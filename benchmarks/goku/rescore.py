@@ -113,15 +113,29 @@ def format_trajectory(history: list) -> str:
     return "\n".join(lines)
 
 
-def collect_file_contents(results_dir: Path) -> str:
+def collect_file_contents(
+    results_dir: Path,
+) -> tuple[str, list[str]]:
     """Read the agent's saved output files for LLM judge context.
 
     Mirrors ``GokuEvaluation._collect_file_contents`` but excludes
     ``bash_events/`` (bash trace files are agent debugging, not artifacts).
+
+    Returns:
+        ``(text_summary, output_media_paths)`` — same shape as the
+        run_infer counterpart. ``output_media_paths`` are absolute paths
+        to agent-produced images/PDFs/videos; the judge attaches them
+        natively via per-provider routing.
     """
     if not results_dir.exists():
-        return "(no output files)"
+        return "(no output files)", []
     contents: list[str] = []
+    media_paths: list[str] = []
+    media_suffixes = {
+        ".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp",
+        ".pdf",
+        ".mp4", ".mov", ".webm", ".avi", ".mkv",
+    }
     for f in sorted(results_dir.rglob("*")):
         if not f.is_file():
             continue
@@ -131,6 +145,16 @@ def collect_file_contents(results_dir: Path) -> str:
             continue
         if rel.parts and rel.parts[0] == "bash_events":
             continue
+
+        suffix = f.suffix.lower()
+        if suffix in media_suffixes:
+            contents.append(
+                f"--- {f.name} --- (attached as output media; "
+                f"{f.stat().st_size:,} bytes)"
+            )
+            media_paths.append(str(f.resolve()))
+            continue
+
         if f.stat().st_size > 50_000:
             contents.append(f"--- {f.name} --- (binary, {f.stat().st_size} bytes)")
             continue
@@ -139,7 +163,8 @@ def collect_file_contents(results_dir: Path) -> str:
             contents.append(f"--- {f.name} ---\n{text[:20000]}")
         except UnicodeDecodeError:
             contents.append(f"--- {f.name} --- (binary, {f.stat().st_size} bytes)")
-    return "\n\n".join(contents) if contents else "(no output files)"
+    text_summary = "\n\n".join(contents) if contents else "(no output files)"
+    return text_summary, media_paths
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -158,6 +183,7 @@ def rescore_single(
     judge_region: str | None,
     skip_llm_judge: bool,
     input_image_paths: list[str] | None = None,
+    output_media_paths: list[str] | None = None,
 ) -> tuple[list[ScorerResult], list[RubricItem]]:
     """Run all rubric items for one task and return per-item results."""
     results: list[ScorerResult] = []
@@ -184,6 +210,7 @@ def rescore_single(
                     judge_api_key=judge_api_key,
                     aws_region_name=judge_region,
                     input_image_paths=input_image_paths or [],
+                    output_media_paths=output_media_paths or [],
                 ))
         else:
             raise ValueError(
@@ -410,7 +437,9 @@ def main() -> None:
         history = agent_data.get("history") or []
         response_text = extract_response_from_history(history)
         trajectory = format_trajectory(history)
-        file_contents = collect_file_contents(scores_file.parent / "results")
+        file_contents, output_media_paths = collect_file_contents(
+            scores_file.parent / "results"
+        )
 
         # Optionally back up the original scores.jsonl
         if args.backup:
@@ -435,6 +464,11 @@ def main() -> None:
                 # the task's input media that the judge needs for visual
                 # grounding (otherwise it has only the agent's claims).
                 input_image_paths=task.input_files,  # type: ignore[union-attr]
+                # Agent-produced media (PDFs/images/videos saved into the
+                # agent's results/ directory). Without this the judge sees
+                # only "(binary, N bytes)" placeholders for them and has
+                # to bluff about their content.
+                output_media_paths=output_media_paths,
             )
         except Exception:
             logger.exception("Scoring failed for %s in %s", task_key, scores_file)
