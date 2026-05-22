@@ -6,15 +6,16 @@ Some providers/routes don't accept native PDF or video input:
   * Kimi K2.5 via Bedrock Converse → no PDF, no video.
   * Claude Opus 4.7 → PDF native, video unsupported (Anthropic has no video).
   * GPT-5.5 → PDF native, video unsupported (OpenAI API explicitly excludes video).
-  * Gemini 3.1 Pro → both native.
+  * Gemini 3.x → both native.
 
 For the AGENT path the model is fixed and we route PDFs natively per-provider
 (see :mod:`benchmarks.goku.media_adapters`). Videos are uniformly rendered to
-keyframes because only Gemini natively supports them and going asymmetric
-across the three agent models would muddy the eval.
+keyframes because going asymmetric across the three agent models would muddy
+the eval.
 
-For the JUDGE path (currently Kimi-Bedrock), both PDFs and videos must be
-rendered to images because Bedrock-Kimi accepts only images.
+For the JUDGE path, fallback rendering kicks in only for providers that don't
+accept native PDF/video (e.g. Kimi-Bedrock). With the default Gemini judge,
+PDFs flow as native `file` blocks and only video keyframe extraction runs.
 
 This module is deliberately thin: just two helpers (`pdf_to_page_images`,
 `video_to_keyframes`) plus a small cache so repeated calls on the same file
@@ -28,6 +29,7 @@ import logging
 import shutil
 import subprocess
 import tempfile
+import uuid
 from pathlib import Path
 
 import pypdfium2 as pdfium
@@ -49,15 +51,31 @@ _CACHE_ROOT = Path(tempfile.gettempdir()) / "goku_media_render"
 #   * Video tasks: ≤60 minutes, ≤200 MB per file
 #   * Image tasks: ≤5 MB per file, up to 20 files
 _DEFAULT_PDF_DPI = 200             # 200 DPI ≈ sharp enough for small body text
-_DEFAULT_KEYFRAME_COUNT = 60       # 1 frame per minute for a 60-min video
+_DEFAULT_KEYFRAME_COUNT = 120      # 2 frames per minute on a 60-min video.
+                                   # Was 60 (1/min) — too sparse to catch
+                                   # popups, brief UI states, or anything
+                                   # that appears for < 60s. JPEG output
+                                   # (~150 KB/frame) makes 120 frames fit
+                                   # easily in one judge call (~18 MB
+                                   # vs ~120 MB for PNG).
 _MAX_PDF_PAGES = 100               # Anthropic native-PDF cap
-_MAX_KEYFRAMES = 120               # safety ceiling (~2× default) for finer sampling
+_MAX_KEYFRAMES = 180               # safety ceiling (1.5× default) for short
+                                   # videos where 3 fpm is feasible. The
+                                   # judge byte cap (90 MB) and block-count
+                                   # cap (100) are the actual hard limits.
 
 # Per-file size + duration caps. These are the upper bound the harness will
 # accept — task_loader fails loud if a task's data/input_files/ exceeds them
 # so annotators see the error at task-discovery time, not silently downstream.
 MAX_PDF_BYTES = 30_000_000         # 30 MB  (Anthropic 32 MB cap − base64 margin)
-MAX_VIDEO_BYTES = 200_000_000      # 200 MB (workspace upload + ffmpeg time)
+MAX_VIDEO_BYTES = 250_000_000      # 250 MB. Was 200 MB — based on Gemini's
+                                   # older Files API limit. Today's API
+                                   # accepts 2 GB; 250 MB gives headroom for
+                                   # ~60-min 1280x720 H.264 content (Cars.mp4
+                                   # for the Aditya Joshi task lands at 200.2
+                                   # MB just barely over the old cap). The
+                                   # binding cost is workspace upload time
+                                   # + ffmpeg keyframe-extract wall, not API.
 MAX_IMAGE_BYTES = 5_000_000        # 5 MB   (Anthropic per-image cap)
 MAX_VIDEO_DURATION_SEC = 60 * 60   # 60 min (Gemini native cap)
 
@@ -91,23 +109,33 @@ def pdf_to_page_images(
     if out_dir.is_dir() and any(out_dir.iterdir()):
         return sorted(out_dir.glob("page_*.png"))
 
-    out_dir.mkdir(parents=True, exist_ok=True)
-    pdf = pdfium.PdfDocument(str(pdf_path))
-    n_pages = min(len(pdf), max_pages)
-    scale = dpi / 72.0  # pypdfium2 takes a scale where 1.0 == 72 DPI
-    paths: list[Path] = []
-    for i in range(n_pages):
-        page = pdf[i]
-        pil_image = page.render(scale=scale).to_pil()
-        dest = out_dir / f"page_{i+1:03d}.png"
-        pil_image.save(dest, format="PNG", optimize=True)
-        paths.append(dest)
-    if len(pdf) > max_pages:
+    # Atomic-publish: render into a unique temp dir under the same parent,
+    # then rename to the final cache key. Two workers racing produce one
+    # winner and one harmless leftover; readers never observe partial output.
+    tmp_dir = _CACHE_ROOT / "pdf" / f".tmp.{key}.{uuid.uuid4().hex[:8]}"
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        with pdfium.PdfDocument(str(pdf_path)) as pdf:
+            n_pages = min(len(pdf), max_pages)
+            scale = dpi / 72.0
+            for i in range(n_pages):
+                page = pdf[i]
+                pil_image = page.render(scale=scale).to_pil()
+                pil_image.save(tmp_dir / f"page_{i+1:03d}.png", format="PNG", optimize=True)
+            full_page_count = len(pdf)
+        try:
+            tmp_dir.rename(out_dir)
+        except OSError:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+    except Exception:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        raise
+    if full_page_count > max_pages:
         logger.warning(
             "PDF %s has %d pages; capped at %d for judge payload",
-            pdf_path.name, len(pdf), max_pages,
+            pdf_path.name, full_page_count, max_pages,
         )
-    return paths
+    return sorted(out_dir.glob("page_*.png"))
 
 
 def video_to_keyframes(
@@ -116,51 +144,64 @@ def video_to_keyframes(
     n_frames: int = _DEFAULT_KEYFRAME_COUNT,
     max_frames: int = _MAX_KEYFRAMES,
 ) -> list[Path]:
-    """Extract ``n_frames`` evenly-spaced frames from ``video_path`` as PNGs.
+    """Extract ``n_frames`` evenly-spaced frames from ``video_path`` as
+    JPEGs (quality 3, very high). Returns paths sorted by frame index.
 
-    Cached: identical (file-content, n_frames) → reuses the previous extract.
+    JPEG over PNG: per-frame size drops from ~1-3 MB to ~100-200 KB with
+    visually negligible loss for the judge's purposes. 120 JPEG frames
+    total ~18 MB; 120 PNG frames would be ~180 MB and trip the judge
+    total-bytes cap. The format choice is part of the cache key so an
+    upgrade from a PNG-era cache forces a re-render.
+
+    Cached: identical (file-content, n_frames, format) → reuses the
+    previous extract.
     """
     video_path = Path(video_path)
     if not video_path.is_file():
         raise FileNotFoundError(f"Video not found: {video_path}")
     n_frames = min(n_frames, max_frames)
-    key = f"{video_path.stem}_{_file_hash(video_path)}_n{n_frames}"
+    # Format tag in the key isolates PNG-era caches from the JPEG era so
+    # an in-place upgrade doesn't return stale, oversized PNG renders.
+    key = f"{video_path.stem}_{_file_hash(video_path)}_n{n_frames}_fmt-jpg"
     out_dir = _CACHE_ROOT / "video" / key
     if out_dir.is_dir() and any(out_dir.iterdir()):
-        return sorted(out_dir.glob("frame_*.png"))
+        return sorted(out_dir.glob("frame_*.jpg"))
 
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    # Probe duration via ffprobe to plan the timestamp grid. Fall back to
-    # ffmpeg's `-vf select` if ffprobe is missing.
-    duration = _probe_duration_seconds(video_path)
-    if duration is None or duration <= 0:
-        # Last-ditch fallback: extract first N frames at native rate.
-        cmd = [
-            "ffmpeg", "-y", "-i", str(video_path),
-            "-frames:v", str(n_frames),
-            "-vf", f"fps=1",  # 1 fps; bounded by -frames:v
-            str(out_dir / "frame_%03d.png"),
-        ]
-        _run_ffmpeg(cmd)
-        return sorted(out_dir.glob("frame_*.png"))
-
-    # Evenly-spaced timestamps: avoid the absolute 0 and absolute end.
-    # For n=8 and duration=6s → [0.375, 1.125, 1.875, 2.625, 3.375, 4.125, 4.875, 5.625]
-    timestamps = [duration * (i + 0.5) / n_frames for i in range(n_frames)]
-    for idx, ts in enumerate(timestamps, start=1):
-        dest = out_dir / f"frame_{idx:03d}.png"
-        cmd = [
-            "ffmpeg", "-y",
-            "-ss", f"{ts:.3f}",
-            "-i", str(video_path),
-            "-frames:v", "1",
-            "-q:v", "2",
-            str(dest),
-        ]
-        _run_ffmpeg(cmd)
-
-    return sorted(out_dir.glob("frame_*.png"))
+    tmp_dir = _CACHE_ROOT / "video" / f".tmp.{key}.{uuid.uuid4().hex[:8]}"
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        duration = _probe_duration_seconds(video_path)
+        if duration is None or duration <= 0:
+            cmd = [
+                "ffmpeg", "-y", "-i", str(video_path),
+                "-frames:v", str(n_frames),
+                "-vf", "fps=1",
+                "-q:v", "3",  # JPEG quality 1-31 (lower=better); 3 = visually lossless
+                str(tmp_dir / "frame_%03d.jpg"),
+            ]
+            _run_ffmpeg(cmd)
+        else:
+            # Single-pass extraction: ask ffmpeg for a constant fps that yields
+            # exactly n_frames over the video's duration. One subprocess instead
+            # of one-per-frame — orders of magnitude faster for long videos.
+            fps_target = n_frames / duration
+            cmd = [
+                "ffmpeg", "-y",
+                "-i", str(video_path),
+                "-vf", f"fps={fps_target:.6f}",
+                "-frames:v", str(n_frames),
+                "-q:v", "3",  # JPEG quality 1-31 (lower=better); 3 = visually lossless
+                str(tmp_dir / "frame_%03d.jpg"),
+            ]
+            _run_ffmpeg(cmd, timeout=300)
+        try:
+            tmp_dir.rename(out_dir)
+        except OSError:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+    except Exception:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        raise
+    return sorted(out_dir.glob("frame_*.jpg"))
 
 
 def _probe_duration_seconds(video_path: Path) -> float | None:
@@ -184,15 +225,14 @@ def _probe_duration_seconds(video_path: Path) -> float | None:
         return None
 
 
-def _run_ffmpeg(cmd: list[str]) -> None:
+def _run_ffmpeg(cmd: list[str], timeout: int = 60) -> None:
     """Run ffmpeg quietly; raise on non-zero exit."""
     if not shutil.which("ffmpeg"):
         raise RuntimeError(
             "ffmpeg not found on PATH. Install via `brew install ffmpeg` "
             "(macOS) or your package manager."
         )
-    result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
     if result.returncode != 0:
-        # ffmpeg writes progress to stderr too, so just take the tail.
         tail = (result.stderr or "")[-800:]
         raise RuntimeError(f"ffmpeg failed (exit {result.returncode}): {tail}")

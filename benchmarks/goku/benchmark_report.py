@@ -13,7 +13,11 @@ from __future__ import annotations
 import logging
 import math
 
-from benchmarks.goku.models import BenchmarkReport, TaskScore
+from benchmarks.goku.models import BenchmarkReport, RubricItem, TaskScore
+
+
+TAB3_TARGET_THRESHOLD = 0.7  # per DIU Goku doc Tab 3 May 15 addendum
+FORMAT_CATEGORY = "FORMAT"
 
 
 logger = logging.getLogger(__name__)
@@ -63,12 +67,66 @@ def pass_hat_n(n: int, c: int) -> bool:
     return c == n
 
 
+def _compute_category_breakdown(
+    task_scores: dict[str, list[TaskScore]],
+    task_rubric_items: dict[str, list[RubricItem]],
+) -> tuple[dict[str, float], float, bool]:
+    """Return (mean_score_by_category, mean_non_format_score, tab3_target_hit).
+
+    Each per-category mean is the average of (awarded/max_total) across
+    rubric items in that category, weighted equally per item, then averaged
+    across tasks and runs.
+    """
+    cat_awarded: dict[str, float] = {}
+    cat_max: dict[str, float] = {}
+
+    for task_key, scores in task_scores.items():
+        rubric_items = task_rubric_items.get(task_key)
+        if not rubric_items or not scores:
+            continue
+        items_by_number = {ri.number: ri for ri in rubric_items}
+        for ts in scores:
+            for res in ts.items:
+                ri = items_by_number.get(res.number)
+                # Per spec: per-category mean is built from POSITIVE items only.
+                # Negative items are penalty-only and contribute to raw_score,
+                # not to per-category correctness percentage. Mirrors the spec's
+                # `max_total = sum(positive points only)` rule (Tab 2 L218).
+                if ri is None or ri.points <= 0:
+                    continue
+                cat = ri.category
+                cat_max[cat] = cat_max.get(cat, 0.0) + ri.points
+                cat_awarded[cat] = cat_awarded.get(cat, 0.0) + (
+                    ri.points if res.passed else 0
+                )
+
+    mean_by_cat: dict[str, float] = {}
+    for cat, mx in cat_max.items():
+        if mx > 0:
+            mean_by_cat[cat] = round(min(1.0, max(0.0, cat_awarded.get(cat, 0.0) / mx)), 4)
+
+    non_format_awarded = sum(
+        v for c, v in cat_awarded.items() if c != FORMAT_CATEGORY
+    )
+    non_format_max = sum(v for c, v in cat_max.items() if c != FORMAT_CATEGORY)
+    if non_format_max > 0:
+        mean_non_format = round(
+            min(1.0, max(0.0, non_format_awarded / non_format_max)), 4
+        )
+        tab3_hit = mean_non_format <= TAB3_TARGET_THRESHOLD
+    else:
+        mean_non_format = 0.0
+        tab3_hit = False
+    return mean_by_cat, mean_non_format, tab3_hit
+
+
 def generate_report(
     task_scores: dict[str, list[TaskScore]],
     model_id: str,
     n_runs: int = 3,
     total_cost_usd: float | None = None,
     per_task_metrics: dict[str, list[dict]] | None = None,
+    task_rubric_items: dict[str, list[RubricItem]] | None = None,
 ) -> BenchmarkReport:
     """Generate a benchmark-level report for one model.
 
@@ -185,6 +243,13 @@ def generate_report(
         agg_cost / n_runs_with_metrics if n_runs_with_metrics > 0 else 0.0
     )
 
+    if task_rubric_items:
+        mean_by_cat, mean_non_format, tab3_hit = _compute_category_breakdown(
+            task_scores, task_rubric_items
+        )
+    else:
+        mean_by_cat, mean_non_format, tab3_hit = {}, 0.0, False
+
     return BenchmarkReport(
         model_id=model_id,
         mean_per_task_score=round(mean_per_task_score, 4),
@@ -201,4 +266,7 @@ def generate_report(
         mean_cost_per_run_usd=round(mean_cost, 4),
         total_runs_with_metrics=n_runs_with_metrics,
         total_judge_cost_usd=round(agg_judge_cost, 4),
+        mean_score_by_category=mean_by_cat,
+        mean_non_format_score=mean_non_format,
+        tab3_difficulty_target_hit=tab3_hit,
     )

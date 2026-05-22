@@ -35,10 +35,18 @@ LLM_CONFIG_DIR="${LLM_CONFIG_DIR:-${REPO_DIR}/.llm_config}"
 # running (e.g. `export OPUS_CONFIG=/path/to/your-opus.json`).
 #
 # Discovery rule (first match wins per role):
-#   model contains "claude"/"opus"/"sonnet"           → OPUS_CONFIG
-#   model contains "gpt"/"openai"/" o1"/"o3"          → GPT_CONFIG
-#   model contains "gemini"                           → GEMINI_CONFIG
-#   model contains "kimi"/"moonshot" or path "judge"  → JUDGE_CONFIG
+#   model contains "claude"/"opus"/"sonnet"           → OPUS_CONFIG (agent)
+#   model contains "gpt"/"openai"                     → GPT_CONFIG  (agent)
+#   model contains "gemini-3"                         → GEMINI_CONFIG (agent)
+#   model contains "gemini-3.5-flash" / filename
+#   contains "flash"/"judge"                          → JUDGE_CONFIG
+#
+# IMPORTANT: Kimi/Moonshot is NO LONGER a valid judge. Bedrock-Kimi has a
+# request-body-size limit (~few MB) that causes hard failures whenever the
+# agent produces multi-MB output media — the judge call returns 400 and
+# every LLM-judged rubric on that task gets a force-fail verdict. Verified
+# in audit. Gemini-3.5-flash is the only supported judge today.
+# Kimi configs are explicitly skipped during discovery below.
 discover_llm_configs() {
     if [[ ! -d "$LLM_CONFIG_DIR" ]]; then
         return 0
@@ -54,17 +62,32 @@ cfg_dir = sys.argv[1]
 SKIP_BASENAMES = {"example.json", "template.json", "sample.json"}
 
 role_keywords = {
-    "JUDGE_CONFIG":  {"filename": ("judge", "kimi", "moonshot"),
-                       "model":    ("kimi", "moonshot")},
+    # Judge: ONLY gemini-3.5-flash. Kimi/Moonshot are explicitly rejected
+    # below (Bedrock body-size errors on multi-MB agent outputs cause
+    # entire judge calls to 400). The "judge" filename token is kept so
+    # operators can name their config file e.g. `gemini-judge.json` and
+    # still get picked up automatically. The "flash" token covers the
+    # default `gemini-3.5-flash.json` naming.
+    "JUDGE_CONFIG":  {"filename": ("flash", "judge"),
+                       "model":    ("gemini-3.5-flash", "gemini-flash")},
     "OPUS_CONFIG":   {"filename": ("opus", "claude", "sonnet"),
                        "model":    ("claude", "opus", "sonnet")},
     "GPT_CONFIG":    {"filename": ("gpt", "openai"),
                        "model":    ("gpt", "openai")},
-    "GEMINI_CONFIG": {"filename": ("gemini",),
-                       "model":    ("gemini",)},
+    # Agent gemini: must NOT match the flash judge — explicitly exclude
+    # the flash variant from agent discovery so the judge config doesn't
+    # accidentally land in the agent slot when both files are present.
+    "GEMINI_CONFIG": {"filename": ("gemini-3.1", "gemini-pro", "gemini_3"),
+                       "model":    ("gemini-3.1", "gemini-pro")},
 }
 
+# Hard-skip list: filenames whose model field marks them as Kimi/Moonshot
+# get dropped from discovery entirely. This is the operator-visible
+# enforcement of "Kimi is not a valid judge anywhere in the pipeline."
+_KIMI_SKIP_MARKERS = ("kimi", "moonshot")
+
 files = []
+skipped_kimi = []
 for path in sorted(glob.glob(os.path.join(cfg_dir, "*.json"))):
     base = os.path.basename(path).lower()
     if base in SKIP_BASENAMES or base.startswith("_"):
@@ -74,7 +97,19 @@ for path in sorted(glob.glob(os.path.join(cfg_dir, "*.json"))):
             data = json.load(f)
     except (OSError, json.JSONDecodeError):
         continue
-    files.append((path, base, str(data.get("model", "")).lower()))
+    model_lower = str(data.get("model", "")).lower()
+    # Kimi/Moonshot is rejected wholesale — neither valid as judge nor as
+    # agent in this pipeline. Body-size limits cause silent score-suppression.
+    if any(k in base or k in model_lower for k in _KIMI_SKIP_MARKERS):
+        skipped_kimi.append(base)
+        continue
+    files.append((path, base, model_lower))
+
+if skipped_kimi:
+    # Emit a comment so the operator sees it in the eval'd shell context.
+    # Doesn't affect bash execution; `eval` ignores comment-only output lines.
+    for b in skipped_kimi:
+        print(f"# skipped Kimi/Moonshot config: {b} (not a supported judge)")
 
 # Score each (file, role) pair: filename match = 2, content match = 1.
 # Pick the highest-scoring file per role, breaking ties by original order.
@@ -117,10 +152,38 @@ JUDGE_CONFIG="${JUDGE_CONFIG:-}"
 
 # Execution parameters
 RUNS_PER_MODEL=3
-MAX_ITERATIONS=30
+MAX_ITERATIONS=100         # Bumped from 30 — heavy multimodal tasks (PIL
+                           # compositing, multi-file generation) routinely
+                           # need 50-80 iterations to complete. 100 leaves
+                           # safe headroom under the 60-min conversation cap.
 NUM_WORKERS=1              # Workers per model run (keep 1 for Docker stability)
 MAX_PARALLEL_MODELS=3      # How many models to run concurrently per task
-RUN_TIMEOUT=1200           # Timeout per single run in seconds (20 min)
+MAX_PARALLEL_TASKS=1       # How many tasks to run concurrently (1 = sequential)
+                           # Total concurrent containers ≈
+                           #   MAX_PARALLEL_TASKS × MAX_PARALLEL_MODELS.
+                           # Each agent-server container needs ~1–2 GB RAM.
+                           # Default 1 (sequential tasks) keeps memory under
+                           # Docker Desktop's typical 8 GB allocation. Bump
+                           # only if Docker has enough RAM headroom.
+RUN_TIMEOUT=3600           # Timeout per single run in seconds (60 min).
+                           # Empirically calibrated against the Aditya
+                           # Joshi 40-min video task on 2026-05-22:
+                           #   - Opus 4.7: 16.9 min end-to-end (inference
+                           #     + judge)
+                           #   - Gemini 3.1: 17.9 min end-to-end
+                           #   - GPT-5.5: ran for 70+ min when allowed —
+                           #     not because of LLM latency but because
+                           #     the model self-loops on ffmpeg contact
+                           #     sheets. 60 min caps that unbounded
+                           #     refinement; the model still gets a
+                           #     reasonable first report and the wrapper
+                           #     proceeds to scoring.
+                           # Was 5400s (90 min) — too generous; the only
+                           # case it covered was an over-iterating
+                           # GPT-5.5, and that case produces a marginally
+                           # better answer at huge wall-time cost.
+                           # Override with --timeout for genuinely long
+                           # tasks.
 CONTAINER_STARTUP_WAIT=10  # Seconds to wait after Docker cleanup
 DOCKER_IMAGE="ghcr.io/openhands/agent-server:0f70e4e-nikolaik_s_python-nodejs_tag_python3.12-nodejs22-source"
 
@@ -163,6 +226,10 @@ while [[ $# -gt 0 ]]; do
             MAX_PARALLEL_MODELS="$2"
             shift 2
             ;;
+        --parallel-tasks)
+            MAX_PARALLEL_TASKS="$2"
+            shift 2
+            ;;
         --output-dir)
             OUTPUT_BASE="$2"
             shift 2
@@ -187,8 +254,11 @@ while [[ $# -gt 0 ]]; do
             echo "  --tasks LIST       Comma-separated task keys (default: all in dataset/)"
             echo "  --models LIST      Comma-separated: opus,gpt,gemini (default: all)"
             echo "  --runs N           Runs per model per task (default: 3)"
-            echo "  --timeout SEC      Timeout per single run (default: 1200)"
-            echo "  --parallel N       Models to run concurrently (default: 3)"
+            echo "  --timeout SEC      Timeout per single run (default: 3600 / 60 min)"
+            echo "  --parallel N       Models to run concurrently per task (default: 3)"
+            echo "  --parallel-tasks N Tasks to run concurrently (default: 1)"
+            echo "                     Total concurrent containers ≈ parallel × parallel-tasks."
+            echo "                     Each container uses ~1-2 GB RAM — size to Docker's memory budget."
             echo "  --output-dir DIR   Output directory (default: eval_outputs)"
             echo "  --skip-export      Skip delivery export at end"
             echo "  --rerun            Strip prior resume-state for --tasks before"
@@ -266,41 +336,108 @@ log_ok()    { log "OK"    "$@"; }
 # ─────────────────────────────────────────────────────────────────────────────
 
 cleanup_docker() {
-    log_info "Cleaning up Docker containers..."
-    
-    # Kill all agent-server containers (running or stopped)
-    local containers
-    containers=$(docker ps -a --filter "ancestor=${DOCKER_IMAGE}" -q 2>/dev/null || true)
-    if [[ -n "$containers" ]]; then
-        echo "$containers" | xargs docker rm -f 2>/dev/null || true
-        log_info "Removed $(echo "$containers" | wc -l | tr -d ' ') agent-server containers"
+    # Scoped cleanup: only remove STOPPED containers. Running containers
+    # are either (a) ours and still doing legitimate work (e.g. an earlier
+    # task's still-running judge phase), or (b) belong to a SIBLING
+    # batch_run.sh invocation. Either way, force-killing them mid-flight
+    # destroys uncommitted work — the GPT-5.5/Aditya scoring loss on
+    # 2026-05-22 happened because a new aman batch's initial cleanup
+    # `docker rm -f`'d the prior batch's still-active scoring container.
+    #
+    # The kill-running-containers safety net is preserved by
+    # kill_ghost_containers() further down, which only kills containers
+    # that have been running longer than RUN_TIMEOUT.
+    #
+    # Our containers are named `agent-server-<uuid>` by the OpenHands SDK
+    # (vendor/software-agent-sdk/openhands-workspace/.../docker_workspace.py).
+    # We match on the `agent-server-` prefix (with the trailing dash) so
+    # unrelated containers that merely contain the substring "agent-server"
+    # in their name are left alone. We also match by ancestor image as a
+    # belt-and-braces measure for the exact image tag we used.
+    log_info "Cleaning up stopped agent-server containers..."
+
+    local removed_total=0
+
+    # Statuses we treat as "safe to remove": these are containers that are
+    # no longer running, so killing them takes no work away. `running` and
+    # `restarting` are deliberately EXCLUDED.
+    for status in exited dead created paused; do
+        local containers
+        containers=$(docker ps -a \
+            --filter "status=$status" \
+            --filter "ancestor=${DOCKER_IMAGE}" \
+            -q 2>/dev/null || true)
+        if [[ -n "$containers" ]]; then
+            echo "$containers" | xargs docker rm 2>/dev/null || true
+            removed_total=$(( removed_total + $(echo "$containers" | wc -l | tr -d ' ') ))
+        fi
+        # Name-prefix match as fallback for any container whose ancestor
+        # image differs from the current ${DOCKER_IMAGE} pin.
+        containers=$(docker ps -a \
+            --filter "status=$status" \
+            --filter "name=^agent-server-" \
+            -q 2>/dev/null || true)
+        if [[ -n "$containers" ]]; then
+            echo "$containers" | xargs docker rm 2>/dev/null || true
+            removed_total=$(( removed_total + $(echo "$containers" | wc -l | tr -d ' ') ))
+        fi
+    done
+
+    if [[ "$removed_total" -gt 0 ]]; then
+        log_info "Removed $removed_total stopped agent-server container(s)"
     fi
-    
-    # Also kill any containers with "agent-server" in name (catches edge cases)
-    containers=$(docker ps -a --filter "name=agent-server" -q 2>/dev/null || true)
-    if [[ -n "$containers" ]]; then
-        echo "$containers" | xargs docker rm -f 2>/dev/null || true
+
+    # Detect (but do not kill) running containers — useful diagnostic when
+    # a sibling batch is active so the operator understands why their slot
+    # count looks higher than expected.
+    local running
+    running=$(docker ps --filter "name=^agent-server-" --format '{{.Names}}' 2>/dev/null || true)
+    if [[ -n "$running" ]]; then
+        local n
+        n=$(echo "$running" | wc -l | tr -d ' ')
+        log_info "Leaving $n running agent-server container(s) alone (sibling batch or active scoring)"
     fi
-    
-    # Prune stopped containers + dangling images (reclaim disk)
-    docker container prune -f 2>/dev/null || true
-    
+
+    # NOTE: do NOT call `docker container prune -f` here. That command
+    # removes every stopped container on the host, including unrelated
+    # ones. The targeted `docker rm` above already cleans up our
+    # stopped containers; disk reclamation for unrelated tenants is not
+    # our job.
+
     # Wait for Docker to stabilize
     sleep 2
 }
 
 kill_ghost_containers() {
-    # Kill containers that have been running longer than RUN_TIMEOUT
+    # Kill containers that have been running longer than RUN_TIMEOUT.
+    # Under cross-task parallelism, sibling tasks' containers may be alive
+    # for legitimate reasons — skip this preemptive sweep entirely. The
+    # per-attempt `timeout` already enforces the per-run cap.
+    if [[ "$MAX_PARALLEL_TASKS" -gt 1 ]]; then
+        return 0
+    fi
     local long_runners
     long_runners=$(docker ps --filter "ancestor=${DOCKER_IMAGE}" --format '{{.ID}} {{.RunningFor}}' 2>/dev/null || true)
     if [[ -n "$long_runners" ]]; then
+        # Threshold scales with RUN_TIMEOUT: anything running longer than
+        # ~RUN_TIMEOUT minutes is a ghost from a prior crashed run.
+        local cutoff_minutes=$(( RUN_TIMEOUT / 60 ))
+        [[ $cutoff_minutes -lt 5 ]] && cutoff_minutes=5
         while IFS= read -r line; do
             local cid
             cid=$(echo "$line" | awk '{print $1}')
-            # If running > 30 minutes, it's a ghost
-            if echo "$line" | grep -qE "(hour|day|[3-9][0-9] minute)"; then
+            # docker's RunningFor strings: "N seconds/minutes/hours/days ago"
+            # Match any "hour|day" or any minute-count >= cutoff_minutes.
+            if echo "$line" | grep -qE "(hour|day)"; then
                 docker rm -f "$cid" 2>/dev/null || true
                 log_warn "Killed ghost container: $cid"
+                continue
+            fi
+            local mins
+            mins=$(echo "$line" | grep -oE '[0-9]+ minute' | head -1 | awk '{print $1}')
+            if [[ -n "$mins" && "$mins" -ge "$cutoff_minutes" ]]; then
+                docker rm -f "$cid" 2>/dev/null || true
+                log_warn "Killed ghost container: $cid (age ${mins} min)"
             fi
         done <<< "$long_runners"
     fi
@@ -401,8 +538,14 @@ is_run_complete() {
         gemini) legacy_pattern="gemini_gemini" ;;
         *)      legacy_pattern="$model" ;;
     esac
+    # Anchor both patterns to a model-dir component that must be followed
+    # by `_sdk_` (the canonical OpenHands output-dir suffix). The previous
+    # pattern `/${legacy_pattern}` was unanchored — a stale legacy slug
+    # appearing anywhere in the path (e.g. as a substring of a sibling
+    # task) would falsely flag the run as complete, causing `--runs N` to
+    # silently short-circuit before producing fresh inference.
     if find "$search_dir" -path "*/${task}/scores.jsonl" 2>/dev/null \
-        | grep -qE "/${export_slug}_sdk_|/${legacy_pattern}"; then
+        | grep -qE "/(${export_slug}|${legacy_pattern})_sdk_"; then
         return 0
     fi
     return 1
@@ -433,8 +576,9 @@ run_model_on_task() {
     model_slug=$(model_to_slug "$model")
     
     local model_output="${OUTPUT_BASE}"
+    # Aggregated log for the whole (task, model) — operator-facing index.
     local model_log="${LOG_DIR}/${task}_${model_slug}.log"
-    
+
     log_info "[${task}] Starting ${model_slug} (${RUNS_PER_MODEL} runs)"
     
     # Check how many runs already complete
@@ -462,20 +606,29 @@ run_model_on_task() {
         while [[ $attempt -lt $MAX_RETRIES_PER_RUN ]] && [[ "$success" == "false" ]]; do
             attempt=$((attempt + 1))
             log_info "[${task}] ${model_slug} run ${run_num} — attempt ${attempt}/${MAX_RETRIES_PER_RUN}"
-            
+
+            # Per-attempt log file. The aggregate `$model_log` collects the
+            # full operator-facing transcript, but inference-output for THIS
+            # attempt also goes to a unique file so the post-run "No instances
+            # to process" grep can only see this attempt's text. Without
+            # this isolation, the grep matches stale text from attempt N-1
+            # and mis-classifies a fresh failure as a harness-skip.
+            local attempt_log="${LOG_DIR}/${task}_${model_slug}_run${run_num}_attempt${attempt}.log"
+
             # Kill any leftover containers before this run
             kill_ghost_containers
-            
+
             if [[ "$DRY_RUN" == "true" ]]; then
                 log_info "[DRY-RUN] Would execute: uv run goku-infer ${model_config} --tasks-dir dataset --task ${task} --runs 1 --workspace docker --max-iterations ${MAX_ITERATIONS} --num-workers ${NUM_WORKERS} --output-dir ${model_output}/run_${run_num} --critic pass --judge-llm-config ${JUDGE_CONFIG}"
                 success=true
                 continue
             fi
-            
-            # Run with timeout
+
+            # Run with timeout. tee to BOTH the per-attempt log (used by
+            # the grep below) and the aggregate (operator inspection).
             local run_start
             run_start=$(date +%s)
-            
+
             if timeout "$RUN_TIMEOUT" uv run goku-infer "$model_config" \
                 --tasks-dir dataset \
                 --task "$task" \
@@ -486,19 +639,21 @@ run_model_on_task() {
                 --output-dir "${model_output}/run_${run_num}" \
                 --critic pass \
                 --judge-llm-config "$JUDGE_CONFIG" \
-                >> "$model_log" 2>&1; then
-                
+                2>&1 | tee "$attempt_log" >> "$model_log"; then
+
                 local run_end
                 run_end=$(date +%s)
                 local duration=$((run_end - run_start))
-                
+
                 # Verify scores.jsonl was produced
                 if is_run_complete "$task" "$model" "$run_num"; then
                     log_ok "[${task}] ${model_slug} run ${run_num} — COMPLETE (${duration}s)"
                     success=true
                 else
-                    # Distinguish silent-skip (harness filter) from honest failure
-                    if grep -q "No instances to process" "$model_log" 2>/dev/null; then
+                    # Distinguish silent-skip (harness filter) from honest failure.
+                    # Grep ONLY the per-attempt log so stale text from a
+                    # previous attempt can't cause a false-positive match.
+                    if grep -q "No instances to process" "$attempt_log" 2>/dev/null; then
                         log_error "[${task}] ${model_slug} run ${run_num} — HARNESS SKIPPED (${duration}s): \"No instances to process\""
                         log_error "  This is the resume-state filter blocking re-inference."
                         log_error "  Fix: re-run this batch with --rerun (strips output.jsonl + output.critic_attempt_*.jsonl)"
@@ -541,9 +696,12 @@ run_task() {
     log_info "TASK: ${task}"
     log_info "═══════════════════════════════════════════════════════"
     
-    # Pre-task Docker cleanup
-    cleanup_docker
-    sleep "$CONTAINER_STARTUP_WAIT"
+    # Pre-task Docker cleanup. Skip under cross-task parallelism — sibling
+    # tasks may have legitimately running containers we must not touch.
+    if [[ "$MAX_PARALLEL_TASKS" -le 1 ]]; then
+        cleanup_docker
+        sleep "$CONTAINER_STARTUP_WAIT"
+    fi
     
     # Get models to run
     local models=()
@@ -590,9 +748,12 @@ run_task() {
         done
     fi
     
-    # Post-task Docker cleanup (prevent container buildup)
-    cleanup_docker
-    
+    # Post-task Docker cleanup (prevent container buildup). Skip under
+    # cross-task parallelism — would kill sibling tasks' containers.
+    if [[ "$MAX_PARALLEL_TASKS" -le 1 ]]; then
+        cleanup_docker
+    fi
+
     log_info "TASK ${task} — ALL MODELS DONE"
     echo ""
 }
@@ -776,11 +937,20 @@ main() {
     if [[ "$RERUN" == "true" && ${#tasks[@]} -gt 0 ]]; then
         local task_csv
         task_csv=$(IFS=,; echo "${tasks[*]}")
-        log_info "--rerun: cleaning resume-state for: ${task_csv}"
+        # Forward --models too, so `--rerun --tasks X --models gpt` clears
+        # state ONLY for the gpt model dir, not for opus + gemini as well.
+        # Without this, a prompt-edit re-run on one model would force the
+        # other two to re-infer needlessly, wasting hours of compute.
+        local models_arg=()
+        if [[ -n "$SPECIFIC_MODELS" ]]; then
+            models_arg=(--models "$SPECIFIC_MODELS")
+        fi
+        log_info "--rerun: cleaning resume-state for: ${task_csv}${SPECIFIC_MODELS:+ (models=${SPECIFIC_MODELS})}"
         if [[ "$DRY_RUN" == "true" ]]; then
             uv run python -m benchmarks.goku.scripts.clean_resume_state \
                 --output-base "$OUTPUT_BASE" \
                 --tasks "$task_csv" \
+                ${models_arg[@]+"${models_arg[@]}"} \
                 --dry-run \
                 >> "$BATCH_LOG" 2>&1 \
                 || log_warn "clean_resume_state (dry-run) reported issues; see batch log"
@@ -788,6 +958,7 @@ main() {
             uv run python -m benchmarks.goku.scripts.clean_resume_state \
                 --output-base "$OUTPUT_BASE" \
                 --tasks "$task_csv" \
+                ${models_arg[@]+"${models_arg[@]}"} \
                 >> "$BATCH_LOG" 2>&1 \
                 || { log_error "clean_resume_state failed; aborting"; exit 1; }
         fi
@@ -801,9 +972,51 @@ main() {
     local batch_start
     batch_start=$(date +%s)
     
-    for task in "${tasks[@]}"; do
-        run_task "$task"
-    done
+    if [[ "$MAX_PARALLEL_TASKS" -le 1 ]]; then
+        # Sequential tasks (default — safest for memory-constrained Docker)
+        for task in "${tasks[@]}"; do
+            run_task "$task"
+        done
+    else
+        # Cross-task parallelism — spawn up to MAX_PARALLEL_TASKS tasks at
+        # once. Each task itself fans out to MAX_PARALLEL_MODELS containers,
+        # so concurrent containers ≈ MAX_PARALLEL_TASKS × MAX_PARALLEL_MODELS.
+        log_info "Cross-task parallelism enabled: up to ${MAX_PARALLEL_TASKS} tasks × ${MAX_PARALLEL_MODELS} models = ${task_cap:=$((MAX_PARALLEL_TASKS * MAX_PARALLEL_MODELS))} concurrent containers."
+        # One-time docker cleanup before launching — sibling tasks will
+        # respect each other's containers thereafter.
+        cleanup_docker
+        sleep "$CONTAINER_STARTUP_WAIT"
+
+        local task_pids=()
+        for task in "${tasks[@]}"; do
+            run_task "$task" &
+            task_pids+=($!)
+
+            # Bound concurrency: when we hit the cap, reap any completed
+            # task processes before spawning more. Spin in a small loop
+            # (not just `wait -n`) so we drain ALL exited children, not
+            # just one — otherwise simultaneous exits can push us over.
+            while [[ ${#task_pids[@]} -ge $MAX_PARALLEL_TASKS ]]; do
+                wait -n "${task_pids[@]}" 2>/dev/null || true
+                local live_pids=()
+                for p in "${task_pids[@]}"; do
+                    if kill -0 "$p" 2>/dev/null; then
+                        live_pids+=("$p")
+                    fi
+                done
+                task_pids=("${live_pids[@]}")
+                # If wait -n returned but no PID was actually reaped (race
+                # with last child), don't busy-loop. Short sleep keeps CPU
+                # idle while we wait for the next exit.
+                [[ ${#task_pids[@]} -ge $MAX_PARALLEL_TASKS ]] && sleep 1
+            done
+        done
+
+        # Drain remaining task processes
+        for pid in "${task_pids[@]}"; do
+            wait "$pid" 2>/dev/null || true
+        done
+    fi
     
     local batch_end
     batch_end=$(date +%s)

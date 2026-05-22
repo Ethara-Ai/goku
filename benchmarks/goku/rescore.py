@@ -113,58 +113,106 @@ def format_trajectory(history: list) -> str:
     return "\n".join(lines)
 
 
-def collect_file_contents(
-    results_dir: Path,
-) -> tuple[str, list[str]]:
-    """Read the agent's saved output files for LLM judge context.
+def collect_file_contents(results_dir: Path) -> tuple[str, list[str]]:
+    """Re-judge path: like run_infer's collector but excludes ``bash_events/``
+    since those are debugging traces, not agent artifacts."""
+    from benchmarks.goku.judge_context import collect_file_contents as _impl
+    return _impl(results_dir, exclude_top_dirs={"bash_events"})
 
-    Mirrors ``GokuEvaluation._collect_file_contents`` but excludes
-    ``bash_events/`` (bash trace files are agent debugging, not artifacts).
 
-    Returns:
-        ``(text_summary, output_media_paths)`` — same shape as the
-        run_infer counterpart. ``output_media_paths`` are absolute paths
-        to agent-produced images/PDFs/videos; the judge attaches them
-        natively via per-provider routing.
+def update_output_jsonl_test_result(
+    output_jsonl: Path,
+    instance_id: str,
+    task_score,  # TaskScore — typed weakly to avoid a circular import at module top
+) -> bool:
+    """Rewrite the ``test_result`` aggregates for ``instance_id`` in ``output_jsonl``.
+
+    Why this exists
+    ---------------
+    Pre-fix, rescore.py only rewrote ``scores.jsonl`` — the per-item file
+    consumed by the delivery export. The benchmark report (``eval_infer.
+    load_scores_from_runs``) instead reads aggregates from ``output.jsonl``'s
+    ``test_result`` block. Without this update, ``goku-eval`` after a rescore
+    silently reports the OLD pre-rescore numbers and the corrected scores
+    never reach ``mean_per_task_score`` / ``pass_rate`` / the JSON report.
+
+    Behavior
+    --------
+      * Locates the line whose ``instance_id`` matches and overwrites only
+        the aggregate fields (``awarded``, ``max_total``, ``raw_score``,
+        ``per_task_score``, ``passed``, ``judge_cost_usd``). All other
+        fields on the line (history, metrics, instance data, instruction,
+        custom ``test_result`` keys) are preserved.
+      * Writes atomically via tempfile + ``os.replace`` so a crash mid-write
+        can't leave a partial file. The rest of the file is unchanged.
+      * No-op when the file is missing, the line isn't found, or the value
+        round-trip would be identical.
+
+    Returns ``True`` if a matching line was rewritten, else ``False``.
     """
-    if not results_dir.exists():
-        return "(no output files)", []
-    contents: list[str] = []
-    media_paths: list[str] = []
-    media_suffixes = {
-        ".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp",
-        ".pdf",
-        ".mp4", ".mov", ".webm", ".avi", ".mkv",
-    }
-    for f in sorted(results_dir.rglob("*")):
-        if not f.is_file():
+    if not output_jsonl.is_file():
+        return False
+    try:
+        lines = output_jsonl.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return False
+
+    updated = False
+    new_lines: list[str] = []
+    for raw in lines:
+        line = raw.rstrip("\n")
+        if not line.strip():
+            new_lines.append(line)
             continue
         try:
-            rel = f.relative_to(results_dir)
-        except ValueError:
+            d = json.loads(line)
+        except (json.JSONDecodeError, ValueError):
+            new_lines.append(line)
             continue
-        if rel.parts and rel.parts[0] == "bash_events":
+        if not isinstance(d, dict) or d.get("instance_id") != instance_id:
+            new_lines.append(line)
             continue
+        tr = d.get("test_result")
+        if not isinstance(tr, dict):
+            tr = {}
+        # Preserve unrelated test_result keys; only overwrite the aggregates
+        # rescore.py freshly computes. Round to match write_scores_jsonl.
+        tr.update({
+            "awarded": task_score.awarded,
+            "max_total": task_score.max_total,
+            "raw_score": round(task_score.raw_score, 4),
+            "per_task_score": round(task_score.per_task_score, 4),
+            "passed": task_score.passed,
+            "judge_cost_usd": round(task_score.judge_cost_usd, 6),
+        })
+        d["test_result"] = tr
+        new_lines.append(json.dumps(d, ensure_ascii=False))
+        updated = True
 
-        suffix = f.suffix.lower()
-        if suffix in media_suffixes:
-            contents.append(
-                f"--- {f.name} --- (attached as output media; "
-                f"{f.stat().st_size:,} bytes)"
-            )
-            media_paths.append(str(f.resolve()))
-            continue
+    if not updated:
+        return False
 
-        if f.stat().st_size > 50_000:
-            contents.append(f"--- {f.name} --- (binary, {f.stat().st_size} bytes)")
-            continue
+    # Atomic write: temp file in same dir → os.replace. Same-filesystem
+    # rename is atomic on POSIX, so concurrent readers see either the old
+    # file or the new one, never a partial.
+    import tempfile
+    fd, tmp_path = tempfile.mkstemp(
+        dir=str(output_jsonl.parent),
+        prefix=f".{output_jsonl.name}.tmp.",
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as tf:
+            tf.write("\n".join(new_lines))
+            if new_lines:
+                tf.write("\n")
+        os.replace(tmp_path, str(output_jsonl))
+    except Exception:
         try:
-            text = f.read_text(encoding="utf-8")
-            contents.append(f"--- {f.name} ---\n{text[:20000]}")
-        except UnicodeDecodeError:
-            contents.append(f"--- {f.name} --- (binary, {f.stat().st_size} bytes)")
-    text_summary = "\n\n".join(contents) if contents else "(no output files)"
-    return text_summary, media_paths
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
+    return True
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -236,8 +284,13 @@ def discover_targets(
     if not output_base.exists():
         raise FileNotFoundError(f"Output directory not found: {output_base}")
     targets: list[tuple[str, Path]] = []
+    # Use the shared archive-detection helper from eval_infer so all
+    # discovery sites in the harness use the same predicate. Previous
+    # `_archive_` substring missed the actual `.archive_pre_rerun_`
+    # naming used by clean_resume_state.py.
+    from benchmarks.goku.eval_infer import _is_archive_path
     for scores_file in sorted(output_base.rglob("scores.jsonl")):
-        if "_archive_" in str(scores_file):
+        if _is_archive_path(scores_file):
             continue
         task_key = scores_file.parent.name
         if not task_key.startswith("task_"):
@@ -245,15 +298,25 @@ def discover_targets(
         if task_filter is not None and task_key not in task_filter:
             continue
         if model_filter is not None:
-            # The model dir name is two levels up: .../<model_dir>/<task>/scores.jsonl
             model_dir_name = scores_file.parent.parent.name
-            if not any(m in model_dir_name for m in model_filter):
+            if model_dir_name not in model_filter:
                 continue
         targets.append((task_key, scores_file))
     return targets
 
 
 def main() -> None:
+    # Eagerly apply httpx_patches only. The judge talks to providers
+    # directly (LiteLLM), not via the docker agent_server, so the SDK
+    # patch IS theoretically safe here for judge calls. But to keep the
+    # behavior simple + consistent with run_infer (avoid the container
+    # serialization landmine), we leave native PDF on the judge to the
+    # `_build_media_blocks` direct-block construction in llm_judge.py —
+    # which already builds the correct per-provider PDF block shape
+    # without going through the SDK DocumentContent class.
+    from benchmarks.utils import httpx_patches
+    httpx_patches.apply()
+
     logging.basicConfig(
         level=os.getenv("LOGLEVEL", "INFO"),
         format="[%(asctime)s] [%(levelname)s] %(message)s",
@@ -281,9 +344,9 @@ def main() -> None:
     parser.add_argument(
         "--models", default=None,
         help=(
-            "Comma-separated substrings to filter which model dirs to "
-            "rescore (default: all). Substring match against the model "
-            "dir name."
+            "Comma-separated EXACT model dir names to rescore "
+            "(default: all). Use the full slug (e.g. "
+            "'claude-opus-4.7_sdk_v1', not 'opus')."
         ),
     )
     parser.add_argument(
@@ -349,7 +412,7 @@ def main() -> None:
         judge_region = getattr(judge_llm, "aws_region_name", None)
     else:
         judge_model = os.getenv(
-            "GOKU_JUDGE_MODEL", "bedrock/converse/moonshotai.kimi-k2.5"
+            "GOKU_JUDGE_MODEL", "gemini/gemini-3.5-flash"
         )
         judge_api_key = os.getenv("AWS_BEARER_TOKEN_BEDROCK")
         judge_region = os.getenv("AWS_REGION_NAME")
@@ -477,6 +540,18 @@ def main() -> None:
 
         task_score = compute_task_score(results, rubric_items)
         write_scores_jsonl(task_score, scores_file, rubric_items=rubric_items)
+        # Propagate the rescored aggregates back into the model-level
+        # output.jsonl. Without this, the downstream benchmark report
+        # (eval_infer.load_scores_from_runs reads test_result from
+        # output.jsonl) silently shows stale pre-rescore numbers.
+        if not update_output_jsonl_test_result(
+            model_output_jsonl, task_key, task_score,
+        ):
+            logger.warning(
+                "Updated %s but could not propagate to %s — benchmark "
+                "report may show stale aggregates for this instance.",
+                scores_file, model_output_jsonl,
+            )
         logger.info(
             "Rescored %s in %s: passed=%s, per_task_score=%.4f, awarded=%d/%d",
             task_key, scores_file.parent.parent.name[:30],

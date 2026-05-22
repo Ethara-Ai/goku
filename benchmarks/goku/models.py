@@ -136,3 +136,26 @@ class BenchmarkReport(BaseModel):
     # 0 for older scores.jsonl files (judge cost only tracked from this
     # version onward) — re-run the batch to populate.
     total_judge_cost_usd: float = Field(default=0.0, ge=0.0)
+    # Per-category mean per_task_score, computed by weighting each rubric
+    # item's outcome by its category. Used to evaluate Tab-3 difficulty
+    # conformance (non-FORMAT average ≤ 0.7 for at least one agent).
+    mean_score_by_category: dict[str, float] = Field(
+        default_factory=dict,
+        description=(
+            "Per-RubricCategory mean of (awarded / max for items in that "
+            "category). FORMAT vs non-FORMAT split surfaces Tab-3 difficulty."
+        ),
+    )
+    mean_non_format_score: float = Field(
+        default=0.0, ge=0.0, le=1.0,
+        description="Mean per_task_score across all non-FORMAT rubric items.",
+    )
+    tab3_difficulty_target_hit: bool = Field(
+        default=False,
+        description=(
+            "True iff this model's mean_non_format_score is ≤ 0.7 "
+            "(Tab-3 difficulty target). Compare across reports for the "
+            "{gpt-5.5, claude-opus-4.7, gemini-3.1-pro} cohort: at least "
+            "one must hit True for the dataset to qualify as on-target."
+        ),
+    )

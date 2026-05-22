@@ -210,14 +210,18 @@ workspace/
 !.openhands/microagents/
 .vscode/
 
-# LLM configuration directory (contains API keys and sensitive configs).
+# LLM configuration directories (contain API keys and sensitive configs).
 # Use `.llm_config/*` (not `.llm_config/`) so the `!example.json` re-include
 # works — git refuses to descend into a dir excluded with a trailing slash.
 .llm_config/*
 !.llm_config/example.json
+# Quarantined / archived LLM configs still contain real credentials.
+.llm_config_disabled/
+.llm_config_archive/
+.llm_config_old/
 
-# Evaluation outputs
-eval_outputs/
+# Evaluation outputs (any suffix: eval_outputs/, eval_outputs_optionA/, etc.)
+eval_outputs*/
 builds/
 
 # Goku benchmark — annotator local content (must NOT be committed)
@@ -226,7 +230,6 @@ dataset/
 dataset_previous/
 dataset.zip
 # Generated runtime outputs
-eval_outputs/
 delivery/
 batch_logs/
 nohup.out
@@ -239,3 +242,14 @@ nohup.out
 delivery_pilot_v1/
 eval_outputs_pilot_v1/
 sqlite_mcp_server.db
+
+# Local analysis artifacts
+*_breakdown_*.md
+*_grades.md
+# Pre-rename archive (one-shot snapshot before a rename refactor)
+_archive_pre_rename_*/
+
+# zip backups of LLM config dirs — never commit
+.llm_config.zip
+.llm_config*.zip
+*.zip

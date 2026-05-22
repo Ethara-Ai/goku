@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 import logging
 import re
+import shutil
+import subprocess
 from pathlib import Path
 
 from benchmarks.goku.media_render import (
@@ -15,6 +17,13 @@ from benchmarks.goku.media_render import (
     _probe_duration_seconds,
 )
 from benchmarks.goku.models import GokuEvalInstance, RubricItem, TaskCategory
+
+
+# Per DIU Goku doc L116-117: factuality rubrics MUST cite which input_file /
+# page / quote supports the criterion. The combination of category + type
+# below is what we consider "factuality" for this validation.
+FACTUALITY_CATEGORIES = {"CORRECTNESS", "MM_REASONING"}
+FACTUALITY_LLM_TYPES = {"response_criteria", "response_not_criteria"}
 
 
 logger = logging.getLogger(__name__)
@@ -147,6 +156,189 @@ def _validate_input_files_for_category(
     )
 
 
+# raw_shell content that ALWAYS exits 0 (rubric trivially passes) or ALWAYS
+# exits non-zero (rubric trivially fails). Annotator placeholders typically
+# look like these; flag so the rubric is meaningful before scoring runs.
+_TRIVIAL_PASS_COMMANDS = frozenset({"true", ":", "/bin/true", "echo ok"})
+_TRIVIAL_FAIL_COMMANDS = frozenset({"false", "/bin/false", "exit 1", "exit 2"})
+
+# Patterns inside raw_shell that violate the spec or threaten the harness.
+# Hard-forbidden: harness paths (Tab 2 L115), network egress, deletion of
+# absolute roots. Soft-warn: non-rooted rm -rf, sudo.
+_HARD_FORBIDDEN_RAW_SHELL_PATTERNS = [
+    (r"/workspace/", "harness path — use bare filenames (DIU L115)"),
+    (r"/home/", "absolute home path — use bare filenames (DIU L115)"),
+    (r"\bcurl\b", "network egress — rubrics must score local artifacts only"),
+    (r"\bwget\b", "network egress — rubrics must score local artifacts only"),
+    (r"\brm\s+-rf?\s+/(?!\w)", "deletion of an absolute root — destructive"),
+]
+_SOFT_WARN_RAW_SHELL_PATTERNS = [
+    (r"\brm\s+-rf?\b", "raw_shell contains `rm -rf` — destructive op in scoring sandbox"),
+    (r"\bsudo\b", "raw_shell contains `sudo` — won't work in the eval sandbox"),
+]
+
+
+def _validate_raw_shell_one(
+    item: RubricItem, task_key: str,
+) -> list[str]:
+    """Validate ONE shell_succeeds_real rubric's raw_shell content.
+
+    Returns a list of warning strings (caller logs them). Raises ValueError
+    on hard errors (empty command, syntax error, hard-forbidden pattern) —
+    those make the rubric unusable and the operator must fix them.
+    """
+    if item.type != "shell_succeeds_real":
+        return []
+
+    cmd = (item.raw_shell or "").strip()
+    if not cmd:
+        raise ValueError(
+            f"Task {task_key}: rubric #{item.number} has "
+            f"type=shell_succeeds_real but raw_shell is empty or missing"
+        )
+
+    warnings: list[str] = []
+
+    if shutil.which("bash"):
+        try:
+            result = subprocess.run(
+                ["bash", "-n", "-c", cmd],
+                capture_output=True, text=True, timeout=10,
+            )
+        except subprocess.TimeoutExpired:
+            warnings.append(
+                f"rubric #{item.number} raw_shell `bash -n` timed out (>10s)"
+            )
+        else:
+            if result.returncode != 0:
+                raise ValueError(
+                    f"Task {task_key}: rubric #{item.number} raw_shell has "
+                    f"bash syntax error: "
+                    f"{(result.stderr or '').strip()[:300]}"
+                )
+
+    for pat, reason in _HARD_FORBIDDEN_RAW_SHELL_PATTERNS:
+        if re.search(pat, cmd):
+            raise ValueError(
+                f"Task {task_key}: rubric #{item.number} raw_shell contains "
+                f"forbidden pattern {pat!r} ({reason}). Fix the rubric before "
+                f"running this task."
+            )
+
+    for pat, reason in _SOFT_WARN_RAW_SHELL_PATTERNS:
+        if re.search(pat, cmd):
+            warnings.append(f"rubric #{item.number}: {reason}")
+
+    if cmd in _TRIVIAL_PASS_COMMANDS:
+        warnings.append(
+            f"rubric #{item.number}: raw_shell is {cmd!r} — task will ALWAYS "
+            f"pass; rubric has no real assertion. Looks like an annotator "
+            f"placeholder."
+        )
+    elif cmd in _TRIVIAL_FAIL_COMMANDS:
+        warnings.append(
+            f"rubric #{item.number}: raw_shell is {cmd!r} — task will ALWAYS "
+            f"fail. Looks like an annotator placeholder."
+        )
+
+    has_python = bool(re.search(r"\bpython3?\b\s+-c|\bpython3?\b\s*<<", cmd))
+    if has_python and "assert" not in cmd and "raise" not in cmd and "sys.exit" not in cmd:
+        warnings.append(
+            f"rubric #{item.number}: raw_shell runs python but contains no "
+            f"`assert`, `raise`, or `sys.exit` — the rubric will pass for any "
+            f"non-crashing script. Was that intended?"
+        )
+
+    return warnings
+
+
+def validate_raw_shell_rubrics(
+    rubric_items: list[RubricItem], task_key: str,
+) -> None:
+    """Run _validate_raw_shell_one over every rubric in a task, collecting
+    warnings and surfacing hard errors. Called from load_task()."""
+    for item in rubric_items:
+        for w in _validate_raw_shell_one(item, task_key):
+            logger.warning("Task %s: %s", task_key, w)
+
+
+# Phrases at the START of a `response_not_criteria` criterion that signal
+# the rubric author may have written a double-negative. For `response_not_
+# criteria`, the criterion text describes the HALLUCINATION the judge
+# should detect. "The agent does not claim X" works as a criterion (judge
+# looks for the absence of X), but only when interpreted as "the indicator
+# is: agent did not claim X" — that's the spec example pattern.
+#
+# Where it breaks: when the negation flips the polarity of an IMAGE/OUTPUT
+# property check, e.g. "the generated images do not appear as flat 2D".
+# The judge reads it literally, finds the agent DID produce 2D images,
+# concludes the literal criterion ("do not appear 2D") is FALSE, returns
+# criteria_met=False — which the harness maps to "no hallucination" → no
+# penalty. The annotator's INTENT was the opposite.
+#
+# We can't tell from the criterion text alone which case it is. We just
+# warn so the annotator reviews — the spec example pattern stays valid,
+# the inverted-polarity case gets surfaced.
+_NEGATIVE_CRITERION_DOUBLE_NEG_HEADS = (
+    "the generated",       # "the generated images do not appear..."
+    "the produced",
+    "the output",
+    "the resulting",
+    "the rendered",
+    "the saved",
+)
+_NEGATION_TOKENS = (" do not ", " does not ", " is not ", " are not ")
+
+
+def _looks_like_double_negative_response_not_criteria(
+    item: RubricItem,
+) -> str | None:
+    """Heuristic: flag suspicious double-negative criteria on
+    response_not_criteria rubrics. Returns a reason string if suspicious,
+    else None.
+
+    Sensitivity tuning: we only trip when the criterion subject is an
+    OUTPUT artifact ("the generated images", "the produced file") AND
+    the criterion contains a negation. Subject = agent action ("the
+    agent does not claim X") matches the spec's example pattern and is
+    intentionally not flagged.
+    """
+    if item.type != "response_not_criteria":
+        return None
+    text = (item.criterion or "").lower()
+    starts_with_output_subject = any(
+        text.lstrip().startswith(h) for h in _NEGATIVE_CRITERION_DOUBLE_NEG_HEADS
+    )
+    if not starts_with_output_subject:
+        return None
+    if not any(tok in text for tok in _NEGATION_TOKENS):
+        return None
+    return (
+        f"rubric #{item.number} is `response_not_criteria` but the criterion "
+        f"reads as 'the [output] does NOT [bad thing]' — likely double-negative. "
+        f"For response_not_criteria, the criterion text should describe the "
+        f"HALLUCINATION to detect (the bad state). Rewrite as 'the [output] "
+        f"[is/appears as] [bad thing]' so the judge fires when the bad state "
+        f"is present. See annotator_guide.md (response_not_criteria polarity)."
+    )
+
+
+def validate_negative_criteria_polarity(
+    rubric_items: list[RubricItem], task_key: str,
+) -> None:
+    """Warn on response_not_criteria rubrics that LOOK like they have
+    inverted polarity (double-negation). Called from load_task().
+
+    Warning-only — we can't auto-fix annotator-authored rubrics. The
+    annotator reviews each warning and either confirms intent (e.g., the
+    spec's 'agent does not claim X' pattern) or rewrites for clarity.
+    """
+    for item in rubric_items:
+        reason = _looks_like_double_negative_response_not_criteria(item)
+        if reason:
+            logger.warning("Task %s: %s", task_key, reason)
+
+
 def discover_tasks(
     tasks_dir: Path, strict: bool = True
 ) -> list[GokuEvalInstance]:
@@ -248,8 +440,11 @@ def load_task(task_dir: Path) -> GokuEvalInstance:
                 f"Task {task_key}: invalid rubric (JSON parse failed) at "
                 f"line {line_num}: {e}"
             ) from e
-        # Header record? (no "number" — distinguishes from rubric items)
-        if isinstance(data, dict) and "number" not in data:
+        # Header records MUST carry `"kind": "header"`. Anything else
+        # without `"number"` is a malformed rubric item and falls through
+        # to RubricItem(...) below, which raises a clear error rather than
+        # silently dropping the line.
+        if isinstance(data, dict) and data.get("kind") == "header":
             if "task_category" in data:
                 cat = data["task_category"]
                 if cat not in {"pdf", "image", "video", "mixed"}:
@@ -264,8 +459,33 @@ def load_task(task_dir: Path) -> GokuEvalInstance:
             rubric_items.append(RubricItem(**data))
         except Exception as e:
             raise ValueError(
-                f"Task {task_key}: invalid rubric at line {line_num}: {e}"
+                f"Task {task_key}: invalid rubric at line {line_num}: {e}. "
+                f"Note: header records must carry `\"kind\": \"header\"`."
             ) from e
+        last = rubric_items[-1]
+        if (
+            last.category in FACTUALITY_CATEGORIES
+            and last.type in FACTUALITY_LLM_TYPES
+            and last.source is None
+        ):
+            logger.warning(
+                "Task %s: rubric #%d is a factuality item "
+                "(category=%s, type=%s) but has no `source` field. Per DIU "
+                "Goku doc L116-117, factuality rubrics MUST cite which "
+                "input_file / page / quote supports the criterion. "
+                "Backfill the `source` field before next vendor delivery.",
+                task_key, last.number, last.category, last.type,
+            )
+
+    if not rubric_items:
+        raise ValueError(
+            f"Task {task_key}: rubrics.jsonl contains no rubric items "
+            f"(only header lines or blanks). Per spec, every task must "
+            f"have at least one rubric item."
+        )
+
+    validate_raw_shell_rubrics(rubric_items, task_key)
+    validate_negative_criteria_polarity(rubric_items, task_key)
 
     input_files: list[str] = []
     input_dir = task_dir / "data" / "input_files"
@@ -302,11 +522,23 @@ def load_task(task_dir: Path) -> GokuEvalInstance:
     )
 
 
+PROBE_TYPES_WITH_PATHS = frozenset({
+    "probe_file_exists",
+    "probe_file_contains",
+    "probe_dir_exists",
+})
+
+
 def validate_instruction(instance: GokuEvalInstance) -> None:
     """Validate that instruction.md uses bare filenames only.
 
     Per doc L114, instruction.md must not contain harness-specific paths like
     /workspace/, /home/, or absolute Windows paths.
+
+    Additionally, per doc L196-200: a `paths:` check in a rubric is only valid
+    when the prompt names that exact filename. We emit a WARNING (not an error)
+    when a probe rubric references a filename the instruction doesn't mention,
+    so annotators can fix the mismatch before promoting to a hard error.
 
     Raises:
         ValueError: If hard-forbidden path patterns are found in instruction.md.
@@ -319,6 +551,24 @@ def validate_instruction(instance: GokuEvalInstance) -> None:
                 f"pattern '{pattern}' — matches: {matches}. "
                 f"Per doc L114, instruction.md must use bare filenames only."
             )
+
+    for item in instance.rubric_items:
+        if item.type not in PROBE_TYPES_WITH_PATHS:
+            continue
+        candidates = list(item.paths or [])
+        if item.path:
+            candidates.append(item.path)
+        for p in candidates:
+            bare = Path(p).name
+            if bare not in instance.instruction:
+                logger.warning(
+                    "Task %s: rubric #%d (type=%s) references file %r but the "
+                    "instruction doesn't mention that filename. Per DIU Goku "
+                    "doc L196-200, paths: checks are only valid when the "
+                    "prompt names the file. Use response_criteria instead, or "
+                    "add the filename to the prompt.",
+                    instance.id, item.number, item.type, p,
+                )
 
     for pattern in WARN_PATH_PATTERNS:
         matches = re.findall(pattern, instance.instruction)

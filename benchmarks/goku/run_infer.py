@@ -13,6 +13,7 @@ Follows the Terra/GAIA Evaluation pattern exactly.
 import base64
 import mimetypes
 import os
+import shlex
 import shutil
 import tempfile
 import time
@@ -22,6 +23,7 @@ from typing import List, Sequence
 from dotenv import load_dotenv
 
 from benchmarks.goku.config import INFER_DEFAULTS
+from benchmarks.goku.judge_context import collect_file_contents
 from benchmarks.goku.media_adapters import detect_provider, supports_native_pdf
 from benchmarks.goku.media_render import video_to_keyframes
 from benchmarks.goku.models import RubricItem
@@ -69,7 +71,7 @@ logger = get_logger(__name__)
 
 
 MAX_IMAGE_DIMENSION = 7680  # Bedrock limit is 8000px; leave margin
-MAX_IMAGE_BYTES = 3_500_000  # 3.5 MB on disk → ~4.7 MB base64 (under 5 MB API limit)
+AGENT_RESIZE_THRESHOLD = 3_500_000  # 3.5 MB on disk → ~4.7 MB base64 (under 5 MB API limit)
 
 # Magic-byte signatures → (mime_type, PIL format name)
 _IMAGE_SIGNATURES: list[tuple[bytes, str, str]] = [
@@ -106,7 +108,7 @@ def _resize_if_needed(image_path: str) -> str:
 
     Handles:
       - Pixel dimension > MAX_IMAGE_DIMENSION (Bedrock 8000px limit)
-      - File size > MAX_IMAGE_BYTES (Bedrock 5MB per-image API limit)
+      - File size > AGENT_RESIZE_THRESHOLD (Bedrock 5MB per-image API limit)
       - MIME-type mismatch (e.g., .png extension but actually WebP)
     """
     import tempfile
@@ -114,12 +116,14 @@ def _resize_if_needed(image_path: str) -> str:
     from PIL import Image
 
     real_mime, real_fmt = _detect_image_format(image_path)
-    img = Image.open(image_path)
+    with Image.open(image_path) as _raw_img:
+        _raw_img.load()
+        img = _raw_img.copy()
     file_size = os.path.getsize(image_path)
     max_dim = max(img.size)
 
     needs_resize = max_dim > MAX_IMAGE_DIMENSION
-    needs_compress = file_size > MAX_IMAGE_BYTES
+    needs_compress = file_size > AGENT_RESIZE_THRESHOLD
 
     # WebP files with .png extension need re-encoding regardless of size
     ext_mime = mimetypes.guess_type(image_path)[0] or "image/png"
@@ -137,10 +141,10 @@ def _resize_if_needed(image_path: str) -> str:
         reasons.append(f"dim {max_dim}→{max(new_size)}px")
     elif needs_compress:
         # Progressive downscale until under limit
-        scale = (MAX_IMAGE_BYTES / file_size) ** 0.5  # rough area estimate
+        scale = (AGENT_RESIZE_THRESHOLD / file_size) ** 0.5  # rough area estimate
         new_size = (int(img.size[0] * scale), int(img.size[1] * scale))
         img = img.resize(new_size, Image.Resampling.LANCZOS)
-        reasons.append(f"size {file_size / 1e6:.1f}→~{MAX_IMAGE_BYTES / 1e6:.1f}MB")
+        reasons.append(f"size {file_size / 1e6:.1f}→~{AGENT_RESIZE_THRESHOLD / 1e6:.1f}MB")
 
     if needs_reencode:
         reasons.append(f"reencode {ext_mime}→{real_mime}")
@@ -160,7 +164,7 @@ def _resize_if_needed(image_path: str) -> str:
 
     # If still over limit, progressively reduce quality / dimensions
     for attempt in range(3):
-        if os.path.getsize(tmp_path) <= MAX_IMAGE_BYTES:
+        if os.path.getsize(tmp_path) <= AGENT_RESIZE_THRESHOLD:
             break
         quality = max(quality - 15, 30)
         scale_factor = 0.75
@@ -273,11 +277,22 @@ class GokuEvaluation(Evaluation):
             "linux/arm64" if _platform.machine() == "arm64" else "linux/amd64"
         )
 
+        # Bedrock agents need AWS_BEARER_TOKEN_BEDROCK in the container env:
+        # the vendored SDK drops `LLM.api_key` for any Bedrock model
+        # (openhands/sdk/llm/llm.py:_get_litellm_api_key_value), so litellm
+        # inside the agent-server has no way to authenticate unless the env
+        # var is forwarded explicitly. AWS_REGION_NAME tags along so the
+        # bearer call targets the same region the token was issued for.
+        merged_forward = list(forward_env or [])
+        for env_key in ("AWS_BEARER_TOKEN_BEDROCK", "AWS_REGION_NAME"):
+            if env_key in os.environ and env_key not in merged_forward:
+                merged_forward.append(env_key)
+
         workspace = create_docker_workspace(
             agent_server_image=EVAL_AGENT_SERVER_IMAGE,
             base_image="nikolaik/python-nodejs:python3.12-nodejs22",
             build_target="binary",
-            forward_env=forward_env or [],
+            forward_env=merged_forward,
             platform=docker_platform,
         )
 
@@ -294,12 +309,66 @@ class GokuEvaluation(Evaluation):
                 f"{getattr(result, 'stderr', '')}"
             )
             time.sleep(2)
+        else:
+            raise RuntimeError(
+                f"Could not create /workspace/results in workspace after 3 "
+                f"attempts. Last stderr: {getattr(result, 'stderr', '')!r}. "
+                f"Subsequent uploads/downloads would fail with confusing "
+                f"errors; failing fast here so the operator sees the cause."
+            )
 
         # Upload ALL input files to workspace (images also uploaded for agent access)
         # Use base64 + execute_command as a fallback because some agent-server
         # images have a bug where the /api/file/upload endpoint returns 500 due
         # to FastAPI redirect_slashes dropping query parameters.
         input_files: list[str] = instance.data.get("input_files", [])
+
+        # P2: Install ffmpeg in the container when video inputs are present
+        # so the agent can extract additional frames or precise timestamps
+        # beyond the pre-computed keyframes (matches the Claude.ai workflow:
+        # ffprobe → identify timestamps → ffmpeg extract → re-view at full
+        # resolution). The Nikolaik base image ships Python + Node but not
+        # ffmpeg; the openhands user is in the sudo group, so `apt-get` is
+        # available. ~30-60 s install cost is amortized once per container.
+        # Skipped for image / PDF tasks to keep their warm-up unchanged.
+        _video_exts = {".mp4", ".mov", ".webm", ".avi", ".mkv"}
+        _has_video_input = any(
+            Path(p).suffix.lower() in _video_exts for p in input_files
+        )
+        if _has_video_input:
+            logger.info(
+                "Video input detected; installing ffmpeg in container "
+                "(one-time apt-get cost, ~30-60s)…"
+            )
+            _ff_t0 = time.time()
+            _ff_result = workspace.execute_command(
+                "sudo apt-get update -qq && "
+                "sudo DEBIAN_FRONTEND=noninteractive apt-get install "
+                "-y -qq ffmpeg < /dev/null",
+                timeout=240.0,
+            )
+            _ff_elapsed = time.time() - _ff_t0
+            _ff_exit = getattr(_ff_result, "exit_code", -1)
+            if _ff_exit == 0:
+                logger.info(
+                    "ffmpeg installed in container in %.1fs", _ff_elapsed,
+                )
+            else:
+                # Non-fatal: agent still has the keyframes we extract
+                # ourselves; it just can't densify them. Log loudly so the
+                # operator can debug if rubric scores look video-degraded.
+                _stderr = (
+                    getattr(_ff_result, "stderr", "")
+                    or getattr(_ff_result, "stdout", "")
+                    or ""
+                )
+                logger.warning(
+                    "ffmpeg install failed (exit=%s, elapsed=%.1fs); agent "
+                    "will only see the pre-extracted keyframes. Last "
+                    "output: %s",
+                    _ff_exit, _ff_elapsed, _stderr[:300],
+                )
+
         for file_path in input_files:
             if not os.path.exists(file_path):
                 logger.warning(f"Input file not found: {file_path}")
@@ -396,18 +465,20 @@ class GokuEvaluation(Evaluation):
                 # spot — ~4× faster than 64 KB, well under the silent-fail
                 # threshold.
                 chunk_size = 256 * 1024
+                remote_b64 = f"/tmp/{file_name}.b64"
+                remote_dst = f"/workspace/{file_name}"
+                q_b64 = shlex.quote(remote_b64)
+                q_dst = shlex.quote(remote_dst)
                 first = True
                 for i in range(0, len(encoded), chunk_size):
                     chunk = encoded[i : i + chunk_size]
                     operator = ">" if first else ">>"
-                    cmd = f"echo -n '{chunk}' {operator} /tmp/{file_name}.b64"
+                    cmd = f"echo -n {shlex.quote(chunk)} {operator} {q_b64}"
                     workspace.execute_command(cmd, timeout=60.0)
                     first = False
 
                 decode_cmd = (
-                    f"base64 -d /tmp/{file_name}.b64 "
-                    f"> /workspace/{file_name} && "
-                    f"rm /tmp/{file_name}.b64"
+                    f"base64 -d {q_b64} > {q_dst} && rm {q_b64}"
                 )
                 decode_result = workspace.execute_command(decode_cmd, timeout=30.0)
                 if getattr(decode_result, "exit_code", -1) == 0:
@@ -456,7 +527,15 @@ class GokuEvaluation(Evaluation):
                 pdf_paths.append(file_path)
             elif ext in ("mp4", "mov", "webm", "avi", "mkv"):
                 try:
-                    frames = video_to_keyframes(file_path, n_frames=8)
+                    # 120 frames = 2 fpm on a 60-min video. Matches the
+                    # judge's default in scorers/llm_judge.py so agent and
+                    # judge see the same representation. JPEG (q=3) output
+                    # via media_render keeps the per-frame size to
+                    # ~100-200 KB so 120 frames ≈ ~18 MB — well under the
+                    # judge's 90 MB total-payload cap. Was 8 (1 per 7.5 min)
+                    # — far too sparse to catch popups, brief UI states,
+                    # or anything appearing for < 60s.
+                    frames = video_to_keyframes(file_path, n_frames=120)
                 except Exception as exc:
                     logger.warning(
                         "Could not extract keyframes from %s: %s. Agent can "
@@ -506,9 +585,20 @@ class GokuEvaluation(Evaluation):
                 provider_hint = "anthropic" if provider == "bedrock_anthropic" else "openai"
                 # 'gemini' uses the same openai-style file block, so it maps to "openai".
                 DocumentContent = sdk_patches.DocumentContent
+                # NOTE: this branch is DORMANT under the current
+                # upstream agent-server image (PyInstaller bundle ignores
+                # our container-side patches, see run_infer.main()
+                # docstring). It only fires if the operator has wired up
+                # both host+container schema patches via a forked build.
+                # pdf_path must be the CONTAINER path for to_llm_dict()
+                # which runs inside the agent_server.
                 for pdf in pdf_paths:
+                    container_pdf_path = f"/workspace/{os.path.basename(pdf)}"
                     content_blocks.append(
-                        DocumentContent(pdf_path=pdf, provider_hint=provider_hint)
+                        DocumentContent(
+                            pdf_path=container_pdf_path,
+                            provider_hint=provider_hint,
+                        )
                     )
             else:
                 # Fallback: render PDF pages to images, attach via ImageContent.
@@ -571,7 +661,7 @@ class GokuEvaluation(Evaluation):
                 details = self.metadata.details or {}
                 judge_model = details.get("judge_model") or os.getenv(
                     "GOKU_JUDGE_MODEL",
-                    "bedrock/converse/moonshotai.kimi-k2.5",
+                    "gemini/gemini-3.5-flash",
                 )
                 judge_api_key = details.get("judge_api_key") or os.getenv(
                     "AWS_BEARER_TOKEN_BEDROCK"
@@ -723,22 +813,31 @@ class GokuEvaluation(Evaluation):
         output_dir = Path(tempfile.mkdtemp(prefix=f"goku_{instance_id}_"))
         exclude_names = set(input_file_names or [])
 
+        max_files = int(os.getenv("GOKU_MAX_DOWNLOAD_FILES", "2000"))
         try:
             result = workspace.execute_command(
-                "find /workspace -type f "
-                "! -path '/workspace/conversations/*' "
-                "! -path '/workspace/.openhands/*' "
-                "2>/dev/null | head -200"
+                f"find /workspace -type f "
+                f"! -path '/workspace/conversations/*' "
+                f"! -path '/workspace/.openhands/*' "
+                f"2>/dev/null | head -{max_files + 1}"
             )
             stdout = (
                 getattr(result, "output", "") or getattr(result, "stdout", "") or ""
             )
             exit_code = getattr(result, "exit_code", -1)
             if exit_code == 0 and stdout.strip():
-                for remote_path in stdout.strip().split("\n"):
-                    remote_path = remote_path.strip()
-                    if not remote_path:
-                        continue
+                remote_paths_raw = [
+                    ln.strip() for ln in stdout.strip().split("\n") if ln.strip()
+                ]
+                if len(remote_paths_raw) > max_files:
+                    logger.warning(
+                        "Task %s produced > %d output files; truncating at %d. "
+                        "Files past this index will NOT be downloaded or scored. "
+                        "Raise GOKU_MAX_DOWNLOAD_FILES if needed.",
+                        instance_id, max_files, max_files,
+                    )
+                    remote_paths_raw = remote_paths_raw[:max_files]
+                for remote_path in remote_paths_raw:
                     file_name = os.path.basename(remote_path)
                     if file_name in exclude_names:
                         continue
@@ -780,63 +879,7 @@ class GokuEvaluation(Evaluation):
     def _collect_file_contents(
         self, output_dir: Path
     ) -> tuple[str, list[str]]:
-        """Read output files for the LLM judge.
-
-        Returns:
-            ``(text_summary, output_media_paths)``:
-              * ``text_summary`` — concatenated text content for all
-                text-readable files (JSON, MD, code, etc.). Binary files
-                show up as ``--- name --- (binary, N bytes)`` placeholders.
-              * ``output_media_paths`` — absolute paths to image / PDF /
-                video files the agent produced. The judge can natively
-                inspect these via the per-provider routing in
-                :mod:`benchmarks.goku.scorers.llm_judge`.
-
-        Before this returned only the text_summary, so agent-produced
-        images/PDFs/videos showed up as opaque "(binary, N bytes)" lines
-        and the judge had to bluff about their content. Now they reach
-        the judge as multimodal content blocks.
-        """
-        contents: list[str] = []
-        media_paths: list[str] = []
-        if not output_dir.exists():
-            return "(no output files)", media_paths
-
-        media_suffixes = {
-            ".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp",   # images
-            ".pdf",                                              # PDFs
-            ".mp4", ".mov", ".webm", ".avi", ".mkv",            # videos
-        }
-        for f in sorted(output_dir.rglob("*")):
-            if not f.is_file():
-                continue
-
-            suffix = f.suffix.lower()
-            if suffix in media_suffixes:
-                # Note in the text summary so the judge knows the file
-                # exists, then list it as a media path for native attach.
-                contents.append(
-                    f"--- {f.name} --- (attached as output media; "
-                    f"{f.stat().st_size:,} bytes)"
-                )
-                media_paths.append(str(f.resolve()))
-                continue
-
-            if f.stat().st_size > 50_000:
-                contents.append(
-                    f"--- {f.name} --- (binary, {f.stat().st_size} bytes)"
-                )
-                continue
-            try:
-                text = f.read_text(encoding="utf-8")
-                contents.append(f"--- {f.name} ---\n{text[:20000]}")
-            except UnicodeDecodeError:
-                contents.append(
-                    f"--- {f.name} --- (binary, {f.stat().st_size} bytes)"
-                )
-
-        text_summary = "\n\n".join(contents) if contents else "(no output files)"
-        return text_summary, media_paths
+        return collect_file_contents(output_dir)
 
     def _format_trajectory(self, events: Sequence[Event]) -> str:
         """Format conversation events as trajectory string for LLM judge context."""
@@ -862,6 +905,24 @@ class GokuEvaluation(Evaluation):
 
 def main() -> None:
     """Main entry point for Goku evaluation."""
+    # Eagerly apply httpx_patches — host-side only, always safe. Mirrors
+    # the sitecustomize wiring that `uv run goku-infer` doesn't auto-fire.
+    #
+    # sdk_patches.apply() is intentionally NOT called here. Investigation
+    # on 2026-05-22 established that the upstream
+    # `ghcr.io/openhands/agent-server:0f70e4e-...` image is a PyInstaller
+    # binary with an embedded Python interpreter that ignores the system
+    # site-packages — so any container-side schema patch via .pth / site-
+    # customize is invisible to the bundled Message validator. The host
+    # patch alone leads to DocumentContent blocks rejected with HTTP 422
+    # (aman PDF task). Native PDF for the agent path requires either
+    # forking the upstream agent_server build pipeline or upstreaming
+    # DocumentContent into OpenHands — both are out of scope here. The
+    # render-pages-to-images fallback remains the working path; see Bug
+    # A optimizations in media_render for the OOM mitigation.
+    from benchmarks.utils import httpx_patches
+    httpx_patches.apply()
+
     parser = get_parser()
     parser.add_argument(
         "--tasks-dir",
@@ -877,14 +938,14 @@ def main() -> None:
     parser.add_argument(
         "--runs",
         type=int,
-        default=3,
-        help="Number of evaluation runs per task (default: 3)",
+        default=1,
+        help="Number of evaluation runs per task (default: 1, per DIU Tab 4 Q&A '1-2 is fine')",
     )
     parser.add_argument(
         "--judge-llm-config",
         type=str,
         default=None,
-        help="Path to LLM config JSON for the judge model (e.g., .llm_config/kimi-k2.5-judge.json)",
+        help="Path to LLM config JSON for the judge model (e.g., .llm_config/gemini-3.5-flash.json)",
     )
     parser.set_defaults(**INFER_DEFAULTS)
     args = parser.parse_args()
@@ -905,6 +966,30 @@ def main() -> None:
 
     llm = load_llm_config(args.llm_config_path)
     logger.info("Using LLM config: %s", llm.model_dump_json(indent=2))
+
+    # Promote a Bedrock bearer token from `LLM.api_key` to the env var the
+    # SDK actually reads. The vendored SDK drops `api_key` for Bedrock (see
+    # prepare_workspace comment), so a config that uses the `api_key` field
+    # otherwise has no way to authenticate. The config value WINS over a
+    # pre-existing shell env var: if a stale token from the user's shell
+    # silently shadowed a rotated token in the config, Bedrock would reject
+    # the request with an opaque "Authentication failed" — surface the
+    # override loudly instead.
+    if llm.model.startswith("bedrock/"):
+        agent_key = getattr(llm, "api_key", None)
+        if hasattr(agent_key, "get_secret_value"):
+            agent_key = agent_key.get_secret_value()
+        if agent_key:
+            prior = os.environ.get("AWS_BEARER_TOKEN_BEDROCK")
+            if prior and prior != str(agent_key):
+                logger.warning(
+                    "Overriding AWS_BEARER_TOKEN_BEDROCK from shell env with "
+                    "the value from %s (shell value differs).",
+                    args.llm_config_path,
+                )
+            os.environ["AWS_BEARER_TOKEN_BEDROCK"] = str(agent_key)
+        if getattr(llm, "aws_region_name", None):
+            os.environ["AWS_REGION_NAME"] = str(llm.aws_region_name)
 
     # Resolve the display name used for output directory naming. The actual
     # LLM `model` identifier may be a long Bedrock ARN (e.g.

@@ -8,7 +8,7 @@ Default values for the Goku multimodal agentic evaluation benchmark.
 INFER_DEFAULTS = {
     "tasks_dir": "tasks",
     "num_workers": 10,
-    "runs_per_model": 3,
+    "runs_per_model": 1,
     "task_timeout_seconds": 600,  # 10 minutes per task run
     "max_retries": 2,
     "enable_condenser": True,
@@ -67,9 +67,10 @@ def get_model_display_name(model_id: str) -> str:
     # 1) Exact match first — short aliases bind here
     if lower in MODEL_DISPLAY_NAMES:
         return MODEL_DISPLAY_NAMES[lower]
-    # 2) Substring fallback — long-form slugs bind here
-    for pattern, display in MODEL_DISPLAY_NAMES.items():
+    # 2) Substring fallback — try longest patterns first so e.g. "claude-opus"
+    #    binds before the shorter "opus" key.
+    for pattern in sorted(MODEL_DISPLAY_NAMES.keys(), key=len, reverse=True):
         if pattern in lower:
-            return display
+            return MODEL_DISPLAY_NAMES[pattern]
     # 3) Slug fallback
     return model_id.replace("/", "_").replace(":", "_")

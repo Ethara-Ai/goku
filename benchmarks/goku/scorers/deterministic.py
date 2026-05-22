@@ -34,6 +34,22 @@ DETERMINISTIC_TYPES = frozenset(
 )
 
 
+def _resolves_within(child: Path, parent: Path) -> bool:
+    """True iff ``child`` resolves to a path under ``parent``. Used to keep
+    probe checks honest when the agent creates symlinks pointing outside
+    the sandbox (e.g. ``output/expected.json -> /etc/passwd``).
+
+    Catches ValueError (not under parent), OSError (resolve failure), and
+    RuntimeError (symlink loop on platforms that raise instead of failing
+    silently). All paths to "outside / inaccessible" return False.
+    """
+    try:
+        child.resolve().relative_to(parent.resolve())
+        return True
+    except (ValueError, OSError, RuntimeError):
+        return False
+
+
 def score_deterministic(
     item: RubricItem,
     output_dir: Path,
@@ -61,12 +77,7 @@ def score_deterministic(
     scorer_fn = _SCORERS[item.type]
     passed, rationale = scorer_fn(item, output_dir, response)
 
-    # Calculate points awarded
-    if item.points > 0:
-        points_awarded = item.points if passed else 0
-    else:
-        # Negative items: points deducted only if criterion IS matched
-        points_awarded = item.points if passed else 0
+    points_awarded = item.points if passed else 0
 
     return ScorerResult(
         number=item.number,
@@ -90,15 +101,23 @@ def _score_probe_file_exists(
     missing: list[str] = []
     found: list[str] = []
     for p in item.paths:
-        # Try direct path first
         full_path = output_dir / p
-        if full_path.exists() and full_path.is_file():
+        if (
+            full_path.exists()
+            and full_path.is_file()
+            and not full_path.is_symlink()
+            and _resolves_within(full_path, output_dir)
+        ):
             size = full_path.stat().st_size
             found.append(f"{p} ({size} bytes)")
             continue
-        # Search recursively for bare filename
         matches = list(output_dir.rglob(p))
-        file_matches = [m for m in matches if m.is_file()]
+        file_matches = [
+            m for m in matches
+            if m.is_file()
+            and not m.is_symlink()
+            and _resolves_within(m, output_dir)
+        ]
         if file_matches:
             size = file_matches[0].stat().st_size
             rel = file_matches[0].relative_to(output_dir)
@@ -132,9 +151,19 @@ def _score_probe_file_contains(
         return False, "No pattern specified in rubric item"
 
     full_path = output_dir / file_path
-    if not full_path.exists():
+    if not (
+        full_path.exists()
+        and full_path.is_file()
+        and not full_path.is_symlink()
+        and _resolves_within(full_path, output_dir)
+    ):
         matches = list(output_dir.rglob(file_path))
-        file_matches = [m for m in matches if m.is_file()]
+        file_matches = [
+            m for m in matches
+            if m.is_file()
+            and not m.is_symlink()
+            and _resolves_within(m, output_dir)
+        ]
         if file_matches:
             full_path = file_matches[0]
         else:
@@ -163,7 +192,12 @@ def _score_probe_dir_exists(
     found: list[str] = []
     for p in item.paths:
         full_path = output_dir / p
-        if full_path.exists() and full_path.is_dir():
+        if (
+            full_path.exists()
+            and full_path.is_dir()
+            and not full_path.is_symlink()
+            and _resolves_within(full_path, output_dir)
+        ):
             found.append(p)
         else:
             missing.append(p)
@@ -239,9 +273,10 @@ def _score_shell_succeeds_real(
 
     try:
         result = subprocess.run(
-            item.raw_shell,
-            shell=True,
+            ["bash", "-c", item.raw_shell],
+            shell=False,
             cwd=str(output_dir),
+            env={"PATH": "/usr/bin:/bin", "LANG": "C"},
             capture_output=True,
             text=True,
             timeout=30,

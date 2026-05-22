@@ -193,7 +193,7 @@ def _write_rubrics_with_category(
     """Helper to write rubrics.jsonl with an optional category header line."""
     lines = []
     if category is not None:
-        lines.append(json.dumps({"task_category": category}))
+        lines.append(json.dumps({"kind": "header", "task_category": category}))
     for r in rubric_items:
         lines.append(json.dumps(r))
     (task_dir / "rubrics.jsonl").write_text("\n".join(lines) + "\n")

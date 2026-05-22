@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import base64
 import logging
+import os
 from pathlib import Path
 from typing import ClassVar, Literal, Sequence
 
@@ -44,7 +45,21 @@ logger = logging.getLogger(__name__)
 
 
 _PATCHED = False
+_LITELLM_OPUS_47_PATCHED = False
 DocumentContent = None  # populated by apply()
+
+# Bedrock application-inference-profile IDs that resolve to Claude Opus 4.7
+# but whose ARN carries no "opus-4-7" substring (the ID is an opaque hash).
+# LiteLLM's `_is_claude_4_7_model` detects family by substring on the model
+# string, so it can't see through these ARNs and falls back to the legacy
+# `thinking.type=enabled` format that Bedrock Opus 4.7 rejects (HTTP 400).
+#
+# Extend this tuple as new profile IDs are provisioned. The env var
+# ``GOKU_OPUS_47_INFERENCE_PROFILE_IDS`` (comma-separated) is merged in at
+# patch time for one-off operator overrides without a code change.
+_KNOWN_OPUS_47_PROFILE_IDS: tuple[str, ...] = (
+    "653flds7ip4s",
+)
 
 
 def apply() -> bool:
@@ -114,8 +129,21 @@ def apply() -> bool:
     # Re-annotate Message.content to admit DocumentContent into the union.
     # Pydantic 2 validates this Sequence union element-wise; we need to
     # rebuild the model so the new annotation is picked up.
+    #
+    # We use a Discriminated Union (keyed off the literal `type` field on
+    # each subtype: "text" / "image" / "document"). Without a discriminator
+    # pydantic tries each member in order and uses ConfigDict(extra="forbid")
+    # on TextContent to short-circuit non-matches — that works but wastes
+    # 2-3 validation attempts per content block AND is fragile if a future
+    # ImageContent change weakens its `extra` config. The discriminated form
+    # is the recommended pydantic pattern for tagged unions like this.
+    from pydantic import Field
+    from typing import Annotated, Union
     new_union = Sequence[
-        _msg.TextContent | _msg.ImageContent | _DocumentContent  # noqa: F821
+        Annotated[
+            Union[_msg.TextContent, _msg.ImageContent, _DocumentContent],
+            Field(discriminator="type"),
+        ]
     ]
     try:
         _msg.Message.model_fields["content"].annotation = new_union
@@ -133,10 +161,91 @@ def apply() -> bool:
     # surface they'd have if upstream had shipped it.
     _msg.DocumentContent = _DocumentContent  # type: ignore[attr-defined]
     DocumentContent = _DocumentContent
+
     _PATCHED = True
+
+    # Independent sub-patch: teach LiteLLM how to recognize our org's opaque
+    # Bedrock inference-profile ARNs as Claude Opus 4.7 so adaptive-thinking
+    # routing works. Tracked on its own sentinel so a future SDK update that
+    # makes the DocumentContent patch unnecessary doesn't accidentally drop
+    # this fix.
+    _patch_litellm_opus_47_detection()
+
+    return True
+
+
+def _patch_litellm_opus_47_detection() -> bool:
+    """Make LiteLLM's adaptive-thinking detector recognize opaque Opus 4.7 ARNs.
+
+    Why
+    ---
+    LiteLLM's ``AnthropicConfig._map_reasoning_effort`` emits the correct
+    ``{type: "adaptive"}`` thinking block only when
+    ``AnthropicModelInfo._is_claude_4_7_model(model)`` returns True. That
+    detector is a substring match for ``opus-4-7``/``opus_4_7``/``opus-4.7``/
+    ``opus_4.7`` on the model arg. Bedrock application-inference-profile
+    ARNs (``bedrock/converse/arn:.../application-inference-profile/<hash>``)
+    contain none of those markers, so detection fails and LiteLLM falls back
+    to the legacy ``{type: "enabled", budget_tokens: N}`` shape — which
+    Bedrock's Opus 4.7 endpoint rejects with HTTP 400.
+
+    Fix
+    ---
+    Wrap ``_is_claude_4_7_model`` so it also returns True when the model
+    string contains any of our known profile IDs (or any IDs supplied via
+    the ``GOKU_OPUS_47_INFERENCE_PROFILE_IDS`` env var). The original
+    detector is still consulted first so direct-model-id callers are
+    unaffected.
+
+    Returns ``True`` if newly applied this call, ``False`` if already
+    applied or LiteLLM isn't importable.
+    """
+    global _LITELLM_OPUS_47_PATCHED
+    if _LITELLM_OPUS_47_PATCHED:
+        return False
+    try:
+        from litellm.llms.anthropic.common_utils import AnthropicModelInfo
+    except ImportError:
+        logger.debug(
+            "LiteLLM not importable; skipping Opus 4.7 inference-profile patch."
+        )
+        return False
+
+    extra_ids: tuple[str, ...] = _KNOWN_OPUS_47_PROFILE_IDS
+    env_override = os.getenv("GOKU_OPUS_47_INFERENCE_PROFILE_IDS", "").strip()
+    if env_override:
+        extra_ids = extra_ids + tuple(
+            tok.strip().lower()
+            for tok in env_override.split(",")
+            if tok.strip()
+        )
+
+    _orig_is_47 = AnthropicModelInfo._is_claude_4_7_model
+
+    @staticmethod
+    def _is_claude_4_7_model_patched(model: str) -> bool:
+        # Preserve original semantics for direct-model-id callers.
+        if _orig_is_47(model):
+            return True
+        if not model:
+            return False
+        lower = model.lower()
+        return any(pid in lower for pid in extra_ids)
+
+    AnthropicModelInfo._is_claude_4_7_model = _is_claude_4_7_model_patched
+    _LITELLM_OPUS_47_PATCHED = True
+    logger.info(
+        "Applied LiteLLM Opus 4.7 inference-profile patch (recognizes IDs: %s)",
+        ", ".join(extra_ids),
+    )
     return True
 
 
 def is_applied() -> bool:
     """Return whether the patch has been installed in this interpreter."""
     return _PATCHED
+
+
+def is_litellm_opus_47_patched() -> bool:
+    """Return whether the LiteLLM Opus 4.7 detection patch is installed."""
+    return _LITELLM_OPUS_47_PATCHED

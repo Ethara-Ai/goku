@@ -16,17 +16,104 @@ from pathlib import Path
 
 from benchmarks.goku.benchmark_report import generate_report
 from benchmarks.goku.calibration import check_calibration
-from benchmarks.goku.models import BenchmarkReport, TaskScore
+from benchmarks.goku.models import BenchmarkReport, RubricItem, ScorerResult, TaskScore
 
 
 logger = logging.getLogger(__name__)
 
 
+# Marker used by clean_resume_state.py when archiving stale per-task data.
+# Anything (file or directory) whose path contains this substring is "dead"
+# data we must not re-import into the delivery package or the benchmark
+# report. The substring is unique-enough that legitimate user paths won't
+# false-positive (we deliberately don't match just "archive").
+_ARCHIVE_MARKER = "archive_pre_rerun"
+
+
+def _is_archive_path(path) -> bool:
+    """True if ``path`` is inside an archive directory or is an archived
+    file created by ``clean_resume_state.py``.
+
+    Naming convention is ``<original_name>.archive_pre_rerun_<TIMESTAMP>``
+    for both directories (per-task subdirs) and files (output.jsonl backups).
+    A previous version of this check used ``_archive_`` as the substring,
+    which misses the actual ``.archive_`` naming and silently dragged
+    archived data into both `load_scores_from_runs` and
+    `export_delivery_format`. Fixed by matching the unambiguous suffix
+    token ``archive_pre_rerun`` instead.
+    """
+    return _ARCHIVE_MARKER in str(path)
+
+
+def _load_items_from_scores_jsonl(
+    scores_path: Path,
+    rubric_items: list[RubricItem],
+) -> list[ScorerResult]:
+    """Parse a per-task ``scores.jsonl`` and return its rubric outcomes.
+
+    Per ``scoring.write_scores_jsonl`` (DIU doc L116-117), each per-item row
+    carries the SPEC display semantic for ``passed``: True means the task
+    PASSED that item (no hallucination for negative items, criterion met for
+    positives). The scoring code's internal semantic for negative items is
+    *inverted* (``result.passed=True`` means the criterion matched, i.e. the
+    hallucination IS present). When we re-load the rows here, we must
+    re-invert negative items so downstream code (per-category aggregation,
+    pass/fail re-derivation) sees consistent internal semantics.
+
+    Args:
+        scores_path: path to a per-task ``scores.jsonl`` file.
+        rubric_items: the task's rubric items, used to look up each item's
+            ``points`` sign by ``number``. Items with no matching rubric
+            entry are loaded as-is (no inversion applied).
+
+    Returns:
+        list of ``ScorerResult``, one per per-item row found. Summary rows
+        (``{"pass": ...}``, ``{"per_task_score": ...}``, etc.) are skipped.
+        Empty list on file-missing or parse failure.
+    """
+    if not scores_path.is_file() or not rubric_items:
+        return []
+    points_by_number = {ri.number: ri.points for ri in rubric_items}
+    items: list[ScorerResult] = []
+    try:
+        with open(scores_path, encoding="utf-8") as sf:
+            for sline in sf:
+                sline = sline.strip()
+                if not sline:
+                    continue
+                try:
+                    srow = json.loads(sline)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(srow, dict) or "number" not in srow:
+                    continue  # summary rows ({pass}, {per_task_score}, etc.)
+                num = srow["number"]
+                display_passed = bool(srow.get("passed", False))
+                # Re-invert negative items back to internal semantics
+                # (criterion-matched=True). See scoring.write_scores_jsonl.
+                points = points_by_number.get(num, 0)
+                internal_passed = (
+                    (not display_passed) if points < 0 else display_passed
+                )
+                # Same convention as scorers/{deterministic,llm_judge}.py:
+                # award full points iff internal_passed, else 0.
+                items.append(ScorerResult(
+                    number=num,
+                    passed=internal_passed,
+                    judge_rationale=srow.get("judge_rationale", "") or "",
+                    points_awarded=points if internal_passed else 0,
+                ))
+    except OSError:
+        return []
+    return items
+
+
 def load_scores_from_runs(
     output_base_dir: Path,
     model_id: str,
-    n_runs: int = 3,
+    n_runs: int = 1,
     claimed_paths: set[Path] | None = None,
+    task_rubric_items: dict[str, list[RubricItem]] | None = None,
 ) -> tuple[dict[str, list[TaskScore]], dict[str, list[dict]]]:
     """Load TaskScore objects (and per-run cost/token metrics) from output.jsonl.
 
@@ -69,7 +156,14 @@ def load_scores_from_runs(
     for run_num in range(1, n_runs + 1):
         run_dir = output_base_dir / f"run_{run_num}"
 
-        output_files = list(run_dir.rglob("output.jsonl"))
+        # Skip archived data — clean_resume_state.py leaves
+        # `output.jsonl.archive_pre_rerun_*` files and per-task subdirs
+        # behind under live model dirs. We never want stale archives in
+        # the benchmark report.
+        output_files = [
+            p for p in run_dir.rglob("output.jsonl")
+            if not _is_archive_path(p)
+        ]
         if not output_files:
             logger.warning(f"No output.jsonl found in {run_dir}")
             continue
@@ -98,13 +192,30 @@ def load_scores_from_runs(
                     if not instance_id or not test_result:
                         continue
 
+                    # Per-item ScorerResult data lives in the per-task
+                    # scores.jsonl (NOT in output.jsonl's test_result, which
+                    # only carries aggregates). Load it here so downstream
+                    # consumers — Tab-3 per-category breakdown, future
+                    # per-item analytics — see real outcomes instead of an
+                    # empty list. When task_rubric_items isn't supplied we
+                    # leave items=[] for backward compat.
+                    scores_path = (
+                        output_file.parent / instance_id / "scores.jsonl"
+                    )
+                    items: list[ScorerResult] = []
+                    if task_rubric_items and instance_id in task_rubric_items:
+                        items = _load_items_from_scores_jsonl(
+                            scores_path,
+                            task_rubric_items[instance_id],
+                        )
+
                     score = TaskScore(
                         awarded=test_result.get("awarded", 0),
                         max_total=test_result.get("max_total", 0),
                         raw_score=test_result.get("raw_score", 0.0),
                         per_task_score=test_result.get("per_task_score", 0.0),
                         passed=test_result.get("passed", False),
-                        items=[],
+                        items=items,
                     )
 
                     if instance_id not in task_scores:
@@ -260,7 +371,7 @@ def export_delivery_format(
     tasks_source_dir: Path,
     delivery_dir: Path,
     model_ids: list[str],
-    n_runs: int = 3,
+    n_runs: int = 1,
 ) -> None:
     """Build the full delivery package per the doc spec.
 
@@ -295,7 +406,13 @@ def export_delivery_format(
 
         for run_num in range(1, n_runs + 1):
             run_dir = output_base_dir / f"run_{run_num}"
-            scores_files = list(run_dir.rglob("scores.jsonl"))
+            # Skip archive paths from clean_resume_state.py — they live
+            # alongside live data and rglob would otherwise drag them
+            # into the delivery package. See _is_archive_path docstring.
+            scores_files = [
+                p for p in run_dir.rglob("scores.jsonl")
+                if not _is_archive_path(p)
+            ]
 
             for scores_file in scores_files:
                 if model_slug not in str(scores_file):
@@ -416,8 +533,8 @@ def main() -> None:
     parser.add_argument(
         "--runs",
         type=int,
-        default=3,
-        help="Number of runs per model (default: 3)",
+        default=1,
+        help="Number of runs per model (default: 1, per DIU Tab 4 Q&A '1-2 is fine')",
     )
     parser.add_argument(
         "--report-file",
@@ -443,6 +560,21 @@ def main() -> None:
     reports: list[BenchmarkReport] = []
     per_model_scores: dict[str, dict[str, float]] = {}
 
+    # If a tasks source dir is given, pre-load rubric items so generate_report
+    # can compute the Tab-3 per-category breakdown. Without this, the new
+    # fields stay empty (graceful degradation for legacy invocations).
+    task_rubric_items: dict[str, list[RubricItem]] = {}
+    if args.tasks_dir:
+        from benchmarks.goku.task_loader import discover_tasks
+        try:
+            for inst in discover_tasks(Path(args.tasks_dir), strict=False):
+                task_rubric_items[inst.id] = inst.rubric_items
+        except FileNotFoundError:
+            logger.warning(
+                "tasks-dir %r not found; Tab-3 per-category breakdown will "
+                "be omitted from the report.", args.tasks_dir,
+            )
+
     # Shared dedup set: each output.jsonl is counted under at most one
     # model_id. Earlier --models entries claim a matching path first.
     claimed_paths: set[Path] = set()
@@ -454,7 +586,14 @@ def main() -> None:
     for model_id in args.models:
         logger.info(f"Loading scores for model: {model_id}")
         task_scores, per_task_metrics = load_scores_from_runs(
-            output_base, model_id, n_runs=args.runs, claimed_paths=claimed_paths
+            output_base, model_id, n_runs=args.runs,
+            claimed_paths=claimed_paths,
+            # Pass rubric items so per-item ScorerResult data is reconstructed
+            # from per-task scores.jsonl files. Required for the Tab-3
+            # per-category breakdown to see real outcomes; without this
+            # `mean_score_by_category`, `mean_non_format_score`, and
+            # `tab3_difficulty_target_hit` silently return empty.
+            task_rubric_items=task_rubric_items or None,
         )
 
         if not task_scores:
@@ -479,6 +618,7 @@ def main() -> None:
             model_id=display_id,
             n_runs=args.runs,
             per_task_metrics=per_task_metrics,
+            task_rubric_items=task_rubric_items or None,
         )
         reports.append(report)
         reports_by_display[display_id] = report

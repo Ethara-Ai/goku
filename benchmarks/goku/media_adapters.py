@@ -59,8 +59,15 @@ def detect_provider(
     return "unknown"
 
 
-def build_pdf_block(pdf_path: str | Path, model_string: str) -> dict:
+def build_pdf_block(
+    pdf_path: str | Path,
+    model_string: str,
+    model_canonical_name: str | None = None,
+) -> dict:
     """Return the ONE content block dict that natively encodes the PDF for ``model_string``.
+
+    For opaque Bedrock ARNs, pass ``model_canonical_name`` so the underlying
+    provider can be detected (the ARN itself carries no provider markers).
 
     Raises ``NotImplementedError`` for providers that don't accept native PDF
     (currently Kimi via Bedrock) — caller should fall back to rendering pages
@@ -69,7 +76,7 @@ def build_pdf_block(pdf_path: str | Path, model_string: str) -> dict:
     path = Path(pdf_path)
     if not path.is_file():
         raise FileNotFoundError(f"PDF not found: {pdf_path}")
-    provider = detect_provider(model_string)
+    provider = detect_provider(model_string, model_canonical_name)
     b64 = base64.b64encode(path.read_bytes()).decode("ascii")
 
     if provider == "bedrock_anthropic":
