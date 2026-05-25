@@ -309,7 +309,7 @@ uv run goku-eval \
 
 `--models` here are substrings of the inference output directory names (e.g.
 `bedrock_converse_arn` matches the ARN-named opus dir). `goku-eval` maps these
-to clean folder names in delivery (`claude-opus`, `gemini-3.1`, `gpt5.5`).
+to clean folder names in delivery (`claude-opus-4.7`, `gemini-3.1-pro`, `gpt-5.5`).
 
 ### Re-scoring after editing rubrics (no inference re-run)
 
@@ -399,7 +399,7 @@ delivery/
             ├── rubrics.jsonl                   # copied from dataset/
             ├── data/input_files/               # copied from dataset/
             └── runs/
-                └── <clean_model_name>/         # claude-opus, gemini-3.1, gpt5.5
+                └── <clean_model_name>/         # claude-opus-4.7, gemini-3.1-pro, gpt-5.5
                     └── run_N/
                         ├── scores.jsonl
                         └── results/

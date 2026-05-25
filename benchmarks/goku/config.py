@@ -27,7 +27,7 @@ CALIBRATION_DEFAULTS = {
 
 # Display names for models in the delivery folder structure.
 # Maps short aliases (exact match) and long-form slug substrings to clean
-# delivery names per the doc spec (e.g. "claude-opus", "gpt5.5", "gemini-3.1").
+# delivery names (e.g. "claude-opus-4.7", "gpt-5.5", "gemini-3.1-pro").
 #
 # Lookup order in get_model_display_name():
 #   1) Exact (case-insensitive) match — handles short aliases passed via --models
@@ -40,17 +40,17 @@ CALIBRATION_DEFAULTS = {
 # effect on inference, LiteLLM calls, or Bedrock routing.
 MODEL_DISPLAY_NAMES: dict[str, str] = {
     # Short aliases (intended for exact match)
-    "bedrock_converse_arn": "claude-opus",
-    "openai": "gpt5.5",
-    "gemini": "gemini-3.1",
+    "bedrock_converse_arn": "claude-opus-4.7",
+    "openai": "gpt-5.5",
+    "gemini": "gemini-3.1-pro",
     # Long-form substrings (intended for substring match against output paths)
-    "claude-opus": "claude-opus",
-    "opus-4": "claude-opus",
-    "653flds7ip4s": "claude-opus",
-    "gpt-5": "gpt5.5",
-    "gpt5": "gpt5.5",
-    "gemini-3": "gemini-3.1",
-    "gemini_gemini": "gemini-3.1",
+    "claude-opus": "claude-opus-4.7",
+    "opus-4": "claude-opus-4.7",
+    "653flds7ip4s": "claude-opus-4.7",
+    "gpt-5": "gpt-5.5",
+    "gpt5": "gpt-5.5",
+    "gemini-3": "gemini-3.1-pro",
+    "gemini_gemini": "gemini-3.1-pro",
     "kimi": "kimi-k2.5",
 }
 
