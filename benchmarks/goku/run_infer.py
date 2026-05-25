@@ -335,6 +335,19 @@ class GokuEvaluation(Evaluation):
         _has_video_input = any(
             Path(p).suffix.lower() in _video_exts for p in input_files
         )
+        _has_pdf_input = any(
+            Path(p).suffix.lower() == ".pdf" for p in input_files
+        )
+        # PDF tool-mode install hook. Mirrors the ffmpeg install pattern:
+        # one-time apt+pip per container, non-fatal on failure. Wires up the
+        # in-container helpers used by ``pdf_pipeline.prepare_pdf_tool_mode``
+        # to let the agent fetch any page at full resolution on demand —
+        # which is the only path that scales to 50+-page PDFs without
+        # exceeding Anthropic's 32 MB body cap. Activated by env var
+        # ``GOKU_PDF_MODE`` (default ``tool``; set to ``inline`` to skip).
+        if _has_pdf_input and os.environ.get("GOKU_PDF_MODE", "tool") == "tool":
+            from benchmarks.goku.pdf_pipeline import install_pdf_deps_in_container
+            install_pdf_deps_in_container(workspace)
         if _has_video_input:
             logger.info(
                 "Video input detected; installing ffmpeg in container "
@@ -570,42 +583,63 @@ class GokuEvaluation(Evaluation):
         if image_urls:
             content_blocks.append(ImageContent(image_urls=image_urls))
         if pdf_paths:
-            # Native PDF per agent provider — SDK extended at sitecustomize.
-            # Falls back to rendering pages to images if (a) the SDK patch
-            # didn't apply or (b) the provider doesn't support native PDF
-            # (today: Kimi via Bedrock — but Kimi isn't an agent model).
-            from benchmarks.utils import sdk_patches
-            agent_model_str = self.metadata.llm.model
-            # Many Bedrock configs use opaque application-inference-profile
-            # ARNs as the model string — the real family is on
-            # `model_canonical_name`. Pass both to detect_provider.
-            canonical = getattr(self.metadata.llm, "model_canonical_name", None)
-            if sdk_patches.is_applied() and supports_native_pdf(agent_model_str, canonical):
-                provider = detect_provider(agent_model_str, canonical)
-                provider_hint = "anthropic" if provider == "bedrock_anthropic" else "openai"
-                # 'gemini' uses the same openai-style file block, so it maps to "openai".
-                DocumentContent = sdk_patches.DocumentContent
-                # NOTE: this branch is DORMANT under the current
-                # upstream agent-server image (PyInstaller bundle ignores
-                # our container-side patches, see run_infer.main()
-                # docstring). It only fires if the operator has wired up
-                # both host+container schema patches via a forked build.
-                # pdf_path must be the CONTAINER path for to_llm_dict()
-                # which runs inside the agent_server.
-                for pdf in pdf_paths:
-                    container_pdf_path = f"/workspace/{os.path.basename(pdf)}"
-                    content_blocks.append(
-                        DocumentContent(
-                            pdf_path=container_pdf_path,
-                            provider_hint=provider_hint,
+            # Two modes, selected by GOKU_PDF_MODE env var:
+            #   * "tool"   (DEFAULT): subsample+tool pipeline. Turn-1 payload
+            #              is a tiny text index + low-DPI thumbnails (~500 KB
+            #              total), and in-container helper scripts let the
+            #              agent fetch any page at full DPI on demand. The
+            #              only path that scales to 50+ pages without
+            #              exceeding Anthropic's 32 MB body cap. Memory-safe
+            #              for the 8 GB GPT container.
+            #   * "inline" (LEGACY): render every page to an ImageContent in
+            #              turn 1. Works for ≤5-page PDFs; 413s on Claude
+            #              and OOMs on GPT past that. Kept reachable for
+            #              smoke tests and the small-PDF case.
+            pdf_mode = os.environ.get("GOKU_PDF_MODE", "tool")
+            if pdf_mode == "tool":
+                from benchmarks.goku.pdf_pipeline import prepare_pdf_tool_mode
+                try:
+                    pdf_setup = prepare_pdf_tool_mode(
+                        pdf_paths, workspace=workspace, write_tools=True,
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "PDF tool-mode setup failed (%s); falling back to "
+                        "inline render. Set GOKU_PDF_MODE=inline to silence.",
+                        exc,
+                    )
+                    pdf_mode = "inline"
+                else:
+                    # Replace the existing instruction TextContent: append the
+                    # tool-mode suffix + the page index so the agent sees the
+                    # navigation hints first, then the per-page text.
+                    content_blocks[0] = TextContent(
+                        text=(
+                            instruction
+                            + "\n\n"
+                            + pdf_setup.agent_prompt_suffix
+                            + "\n\n## Page index\n\n"
+                            + pdf_setup.index_markdown
                         )
                     )
-            else:
-                # Fallback: render PDF pages to images, attach via ImageContent.
+                    # One ImageContent block with all thumbnails. Per-thumbnail
+                    # ~10 KB at DPI 50; 55 pages × 10 KB = ~550 KB total.
+                    thumb_urls = [
+                        _image_to_base64_url(str(p))
+                        for p in pdf_setup.thumbnail_paths
+                    ]
+                    if thumb_urls:
+                        content_blocks.append(ImageContent(image_urls=thumb_urls))
+            if pdf_mode == "inline":
+                # Legacy: render PDF pages to images, attach via ImageContent.
+                # Note: above 5-page PDFs this blows Anthropic's 32 MB cap.
+                # Native DocumentContent path remains DORMANT (PyInstaller
+                # bundle in upstream agent_server ignores our schema patch;
+                # see main() docstring) — we do not attempt it here.
                 from benchmarks.goku.media_render import pdf_to_page_images
                 logger.info(
-                    "Native PDF unavailable for %s (canonical=%s) — rendering pages to images",
-                    agent_model_str, canonical,
+                    "PDF inline mode active for %s — rendering pages to images",
+                    self.metadata.llm.model,
                 )
                 rendered_urls: list[str] = []
                 for pdf in pdf_paths:

@@ -95,10 +95,26 @@ def strip_task_from_jsonl(
         )
         return (len(keep), removed)
 
-    # Archive original before overwriting (idempotent — skip if archive exists)
+    # Archive original before overwriting (idempotent — skip if archive exists).
+    # Captures the state at this exact rerun moment; useful for forensic
+    # comparison but lossy across multiple rerun cycles.
     archive = jsonl_path.with_suffix(jsonl_path.suffix + archive_suffix)
     if not archive.exists():
         shutil.copy2(jsonl_path, archive)
+
+    # Cumulative ledger (2026-05-23 / P1 fix). Across many `--rerun` cycles
+    # individual archive snapshots become sparse — each only captures the
+    # state at one moment. If task A's entry is stripped in cycle 1, then
+    # cycle 2's archive sees an output.jsonl that no longer mentions A.
+    # Re-scoring task A months later then needs to find SOME archive that
+    # was taken between A's most recent inference and its first strip.
+    #
+    # The cumulative ledger ``output.jsonl.ever_seen`` accumulates EVERY
+    # entry ever observed (de-duped by instance_id + attempt) and is never
+    # stripped. It's the authoritative recovery source for ``rescore.py``
+    # when the live ``output.jsonl`` has had entries removed.
+    ever_seen_path = jsonl_path.with_suffix(jsonl_path.suffix + ".ever_seen")
+    _append_to_ever_seen(jsonl_path, ever_seen_path)
 
     new_content = "\n".join(keep) + ("\n" if keep else "")
     jsonl_path.write_text(new_content, encoding="utf-8")
@@ -107,6 +123,62 @@ def strip_task_from_jsonl(
         removed, jsonl_path, len(keep), archive.name,
     )
     return (len(keep), removed)
+
+
+def _append_to_ever_seen(live_path: Path, ever_seen_path: Path) -> int:
+    """Merge any entries from ``live_path`` not already in ``ever_seen_path``
+    into ``ever_seen_path``. De-dupes by ``(instance_id, attempt)``.
+
+    Idempotent: running twice has no effect after the first call.
+    Returns the number of newly-added entries.
+    """
+    # Build the set of (instance_id, attempt) already in ever_seen.
+    seen: set[tuple[str, int]] = set()
+    if ever_seen_path.is_file():
+        for line in ever_seen_path.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                d = json.loads(line)
+            except (json.JSONDecodeError, ValueError):
+                continue
+            if isinstance(d, dict):
+                key = (str(d.get("instance_id", "")), int(d.get("attempt", 0) or 0))
+                seen.add(key)
+
+    # Walk live file and append novel entries.
+    new_lines: list[str] = []
+    if live_path.is_file():
+        for raw_line in live_path.read_text(encoding="utf-8").splitlines():
+            line = raw_line.strip()
+            if not line:
+                continue
+            try:
+                d = json.loads(line)
+            except (json.JSONDecodeError, ValueError):
+                # Preserve malformed lines too — append unconditionally if
+                # they don't match anything we've seen exactly.
+                if line not in {x.strip() for x in (ever_seen_path.read_text().splitlines() if ever_seen_path.is_file() else [])}:
+                    new_lines.append(line)
+                continue
+            if not isinstance(d, dict):
+                continue
+            key = (str(d.get("instance_id", "")), int(d.get("attempt", 0) or 0))
+            if key in seen:
+                continue
+            seen.add(key)
+            new_lines.append(line)
+
+    if new_lines:
+        with ever_seen_path.open("a", encoding="utf-8") as f:
+            for ln in new_lines:
+                f.write(ln + "\n")
+        logger.info(
+            "ever_seen ledger: appended %d new entry(ies) to %s",
+            len(new_lines), ever_seen_path.name,
+        )
+    return len(new_lines)
 
 
 def archive_task_artifacts(

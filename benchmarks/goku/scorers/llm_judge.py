@@ -767,7 +767,17 @@ def _score_llm_judge_single(
     else:
         message_content = prompt
 
-    # Call LLM judge
+    # Call LLM judge.
+    #
+    # max_tokens=16384: bumped from 4096 (2026-05-22). Gemini 3.5 Flash burns
+    # "thinking" tokens INSIDE this budget before the final JSON is emitted —
+    # for cross-modal reasoning on dense PDFs (e.g. pdf_04 rubric #4 mapping
+    # an image label to a part number across two catalogs), the thinking phase
+    # alone can hit 4-6 K tokens, leaving the final JSON truncated mid-
+    # rationale. The scorer then falls back to "Judge returned invalid JSON"
+    # → passed=False, which silently penalises correct judgements.
+    # 16384 matches the value already in .llm_config/gemini-3.5-flash.json
+    # — without this override, the config setting is shadowed.
     raw_content = ""
     judge_cost_usd = 0.0
     try:
@@ -775,7 +785,7 @@ def _score_llm_judge_single(
             "model": judge_model,
             "messages": [{"role": "user", "content": message_content}],
             "temperature": 0.0,
-            "max_tokens": 4096,
+            "max_tokens": 16384,
             "response_format": {"type": "json_object"},
         }
         if judge_base_url:
@@ -821,7 +831,31 @@ def _score_llm_judge_single(
                 cleaned = cleaned[: -len("```")]
             cleaned = cleaned.strip()
 
-        result = json.loads(cleaned)
+        try:
+            result = json.loads(cleaned)
+        except json.JSONDecodeError as _strict_err:
+            # Fallback path. Gemini 3.5 Flash empirically emits JSON with
+            # unescaped inner double-quotes or stray newlines inside the
+            # `reasoning` string (verified on pdf_04 rubric #4, 2026-05-22).
+            # `response_format: json_object` does not fully prevent this.
+            # Before silently failing the rubric, try json-repair which is
+            # designed exactly for this LLM-output cleanup.
+            try:
+                import json_repair  # local import to keep cold-import light
+                repaired = json_repair.loads(cleaned)
+            except Exception:
+                # Repair failed too — fall through to the outer JSONDecodeError
+                # handler. Re-raise the ORIGINAL strict error so the operator
+                # sees the real malformation, not a wrapped repair failure.
+                raise _strict_err
+            if not isinstance(repaired, dict):
+                raise _strict_err
+            result = repaired
+            logger.info(
+                "Judge JSON repair succeeded for item #%d "
+                "(strict json.loads failed: %s)",
+                item.number, _strict_err,
+            )
         criteria_met = bool(result.get("criteria_met", False))
         reasoning = str(result.get("reasoning", "No reasoning provided"))
 

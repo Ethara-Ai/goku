@@ -46,7 +46,7 @@ file/shell checks + LLM-judged criteria).
 git clone <this-repo-url> goku
 cd goku
 make build          # syncs submodules, runs `uv sync --dev`, sets up pre-commit
-make test           # runs unit tests; should report 161 passed (goku module)
+make test           # runs unit tests; should report 303 passed (goku module)
 ```
 
 ---
@@ -161,9 +161,30 @@ text description of its own output — the judge would have to bluff.
 | File type | Agent (Claude / GPT / Gemini) | Judge (Kimi by default) |
 |---|---|---|
 | **Image** (PNG/JPG/JPEG/GIF/WEBP) | Native `image_url` block | Native `image_url` block |
-| **PDF** | Native per provider: `document` block (Claude) / `file` block (GPT, Gemini) | If judge supports native PDF: native block. If not (Kimi-Bedrock): **rendered to page PNGs via `pypdfium2`** at 200 DPI and attached as images. |
+| **PDF** | **Default `GOKU_PDF_MODE=tool`** — per-page text index + 50-DPI thumbnails attached on turn 1 (~700 KB total); agent fetches any page at full resolution via in-container `pdf_page` shell tool. Turn-1 body stays bounded ~5 MB regardless of PDF size. Optional `GOKU_PDF_MODE=inline` uses native per-provider blocks: `document` (Claude) / `file` (GPT, Gemini). | If judge supports native PDF: native block. If not (Kimi-Bedrock): **rendered to page PNGs via `pypdfium2`** at 200 DPI and attached as images. |
 | **Video** (MP4/MOV/WEBM/AVI/MKV) | **Uniformly extracted to 60 keyframes via `ffmpeg`**, attached as images. Symmetric across all 3 agent models so video task scores stay comparable. | Same: 60 keyframes via `ffmpeg`. |
 | Other (CSV, JSON, MD, code, …) | Uploaded to `/workspace/` only — agent reads via shell/tool calls. | Not attached; judge sees the agent's text summary only. |
+
+### PDF tool-mode pipeline (default)
+
+The tool-mode pipeline keeps the turn-1 payload bounded regardless of PDF
+size while still giving the agent full-resolution access on demand:
+
+- **Turn 1** payload: a per-page text index (truncated at 400 chars) + 50-DPI
+  JPEG thumbnails of every page (~10 KB each). Combined turn-1 body is
+  ~700 KB for a 55-page PDF.
+- **In container**: a `pdf_page` shell tool renders any specific page at
+  agent-chosen DPI on demand, auto-clamped so output stays ≤2000 px in
+  either dimension.
+- **Per-turn** body stays bounded ~5 MB regardless of total PDF size.
+
+Toggle:
+- `GOKU_PDF_MODE=tool` (default) — the pipeline above.
+- `GOKU_PDF_MODE=inline` — native per-provider PDF blocks. Suitable for
+  small PDFs and provider-native parsing tests.
+
+Gating is purely on `input_files`: tasks with no PDFs never trigger the
+tool-mode setup, regardless of env var.
 
 ### Task categories — strict siloing
 
@@ -452,6 +473,10 @@ Benchmark-level (across tasks):
 | `Task X: input_files violate per-category limits` | A task declares `task_category` in `rubrics.jsonl` but its files violate the cap (wrong extension, oversized, video too long). The error message names the file and the cap. Either fix the file or change/remove the `task_category` header. |
 | `Task X: invalid task_category 'foo'` | `task_category` must be one of `pdf` / `image` / `video` / `mixed`. Fix the header line. |
 | Legacy task loads with a WARNING about cap violations | Task has no `task_category` header, the loader inferred one from extensions, and a file exceeds the inferred-category cap. Either compress/downscale the file or add an explicit `task_category` header so the loader uses strict validation. |
+| Anthropic 413 `request body too large` on a PDF task | Use the default `GOKU_PDF_MODE=tool` (turn-1 payload stays bounded ~5 MB). The `inline` mode is only for small PDFs. |
+| Anthropic 400 `image dimensions exceed max allowed size for many-image requests: 2000 pixels` | The `pdf_page` tool auto-clamps DPI per page to stay ≤2000 px in either dimension. If you're hitting this, the agent picked an explicit `--dpi` higher than safe — rely on the default or lower it. |
+| `goku-rescore` reports `No entry for task X in output.jsonl` | Rescore falls back to the cumulative `output.jsonl.ever_seen` ledger automatically; this message only surfaces when neither file has the entry. Re-run inference for the task once to repopulate. |
+| `Truncated JSON judge response — using json_repair fallback` | The judge auto-repairs truncated JSON via `json_repair` and continues. If you see this often, shorten the rubric criterion so the judge's rationale fits within the 16 K-token budget. |
 
 ---
 
@@ -474,7 +499,9 @@ goku/
 │   ├── scorers/
 │   │   ├── deterministic.py        # probe_*, shell_*, response_contains/regex
 │   │   └── llm_judge.py            # response_criteria, response_not_criteria
-│   └── tests/                      # 161 unit tests
+│   ├── pdf_pipeline.py             # PDF subsample+tool pipeline (turn-1 ≤5 MB,
+│   │                               #   on-demand high-res via container tools)
+│   └── tests/                      # 303 unit tests
 ├── benchmarks/utils/
 │   ├── sdk_patches.py              # runtime extension of OpenHands SDK Message
 │   │                               #   for native PDF content blocks

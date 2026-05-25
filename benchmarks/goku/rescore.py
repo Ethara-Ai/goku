@@ -462,36 +462,51 @@ def main() -> None:
             n_skip += 1
             continue
 
-        # Find the model-level output.jsonl that contains this task's record
-        model_output_jsonl = scores_file.parent.parent / "output.jsonl"
-        if not model_output_jsonl.is_file():
-            logger.warning("No output.jsonl beside %s — skipping", scores_file)
-            n_skip += 1
-            continue
+        # Find the model-level output.jsonl that contains this task's record.
+        # On miss, fall back to the cumulative ``output.jsonl.ever_seen``
+        # ledger that clean_resume_state.py maintains across --rerun cycles
+        # (2026-05-23 / P1 fix). Without that fallback, repeated --rerun
+        # cleanups make an entry permanently unrescore-able.
+        model_dir = scores_file.parent.parent
+        model_output_jsonl = model_dir / "output.jsonl"
+        ever_seen_jsonl = model_dir / "output.jsonl.ever_seen"
 
-        agent_data = None
-        try:
-            with open(model_output_jsonl, encoding="utf-8") as f:
-                for line in f:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        d = json.loads(line)
-                    except json.JSONDecodeError:
-                        continue
-                    if d.get("instance_id") == task_key:
-                        agent_data = d
-                        break
-        except OSError as e:
-            logger.error("Could not read %s: %s", model_output_jsonl, e)
-            n_fail += 1
-            continue
+        def _find_entry(jsonl_path: Path) -> dict | None:
+            if not jsonl_path.is_file():
+                return None
+            try:
+                with open(jsonl_path, encoding="utf-8") as f:
+                    for raw in f:
+                        raw = raw.strip()
+                        if not raw:
+                            continue
+                        try:
+                            obj = json.loads(raw)
+                        except json.JSONDecodeError:
+                            continue
+                        if obj.get("instance_id") == task_key:
+                            return obj
+            except OSError:
+                return None
+            return None
+
+        agent_data = _find_entry(model_output_jsonl)
+        if agent_data is None:
+            agent_data = _find_entry(ever_seen_jsonl)
+            if agent_data is not None:
+                logger.info(
+                    "Recovered %s entry from %s (live output.jsonl no longer "
+                    "has it — likely stripped by prior --rerun)",
+                    task_key, ever_seen_jsonl.name,
+                )
 
         if agent_data is None:
+            both = model_output_jsonl.name
+            if ever_seen_jsonl.is_file():
+                both += f" or {ever_seen_jsonl.name}"
             logger.warning(
-                "No output.jsonl entry for %s in %s — skipping",
-                task_key, model_output_jsonl,
+                "No entry for %s in %s — skipping",
+                task_key, both,
             )
             n_skip += 1
             continue

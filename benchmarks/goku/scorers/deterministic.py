@@ -267,32 +267,102 @@ def _clean_shell_stderr(err: str, budget: int = 400) -> str:
 def _score_shell_succeeds_real(
     item: RubricItem, output_dir: Path, _response: str
 ) -> tuple[bool, str]:
-    """Run a shell command and check it exits with code 0."""
+    """Run a shell command and check it exits with code 0.
+
+    Fallback for agent-created subdirectories (2026-05-23 / P0 fix)
+    ----------------------------------------------------------------
+    Some agents (notably claude-opus 4.7) reliably save their outputs into a
+    self-named subdirectory like ``/workspace/results/`` or
+    ``/workspace/project/``. Our ``_download_outputs()`` then copies that
+    subdir down to ``task/results/<subdir>/`` on the host. Rubrics written
+    with bare-path references (``open('foo.json')``) then fail with
+    ``FileNotFoundError`` even though the file IS present, just one level
+    deeper than the rubric expects.
+
+    To avoid silently penalising the model for an organisational choice,
+    when the direct execution fails with a ``FileNotFoundError`` for a
+    bare filename, we search ``output_dir`` recursively for that filename
+    and retry the same shell command from each candidate parent dir.
+    Existing PASSES are unchanged (direct execution wins early). Existing
+    fails that aren't FileNotFoundError are unchanged. Only newly-correct
+    PASSES emerge — never new fails.
+    """
     if not item.raw_shell:
         return False, "No raw_shell command specified in rubric item"
 
-    try:
-        result = subprocess.run(
+    def _run(cwd: Path):
+        return subprocess.run(
             ["bash", "-c", item.raw_shell],
             shell=False,
-            cwd=str(output_dir),
+            cwd=str(cwd),
             env={"PATH": "/usr/bin:/bin", "LANG": "C"},
             capture_output=True,
             text=True,
             timeout=30,
         )
-        if result.returncode == 0:
-            stdout_preview = result.stdout[:200] if result.stdout else "(empty)"
-            return True, f"Shell command exited 0. stdout: {stdout_preview}"
-        stderr_preview = _clean_shell_stderr(result.stderr or "", budget=400)
-        return (
-            False,
-            f"Shell command exited {result.returncode}. stderr: {stderr_preview}",
-        )
+
+    try:
+        result = _run(output_dir)
     except subprocess.TimeoutExpired:
         return False, "Shell command timed out after 30 seconds"
     except Exception as e:
         return False, f"Shell command failed: {e}"
+
+    if result.returncode == 0:
+        stdout_preview = result.stdout[:200] if result.stdout else "(empty)"
+        return True, f"Shell command exited 0. stdout: {stdout_preview}"
+
+    # Subdir fallback: only triggers on FileNotFoundError for a bare filename.
+    # Restrict to bare names (no path separators) so the rubric author's
+    # intent — "the file lives directly under cwd" — is what we're rescuing.
+    stderr_full = result.stderr or ""
+    m = re.search(r"FileNotFoundError.*?'([^/']+\.[A-Za-z0-9]+)'", stderr_full)
+    fallback_attempt = None  # (subdir, retry_result) for diagnostic if all fail
+    if m:
+        missing_name = m.group(1)
+        try:
+            candidates = sorted(output_dir.rglob(missing_name))
+        except OSError:
+            candidates = []
+        for hit in candidates:
+            if not hit.is_file() or hit.parent == output_dir:
+                continue
+            # Ensure the subdir is a descendant of output_dir (guard against
+            # symlinks pointing outside the task dir).
+            try:
+                rel_parent = hit.parent.relative_to(output_dir)
+            except ValueError:
+                continue
+            try:
+                retry = _run(hit.parent)
+            except (subprocess.TimeoutExpired, OSError):
+                continue
+            if retry.returncode == 0:
+                stdout_preview = retry.stdout[:200] if retry.stdout else "(empty)"
+                return True, (
+                    f"Shell command exited 0 (resolved via subdir '{rel_parent}/' "
+                    f"— file '{missing_name}' was saved one level deeper "
+                    f"than the rubric expected). stdout: {stdout_preview}"
+                )
+            # Remember the first non-zero retry so we can surface a clearer
+            # diagnostic — the file was found, but the rubric still failed.
+            if fallback_attempt is None:
+                fallback_attempt = (rel_parent, missing_name, retry)
+
+    if fallback_attempt is not None:
+        rel_parent, missing_name, retry = fallback_attempt
+        retry_stderr = _clean_shell_stderr(retry.stderr or "", budget=400)
+        return (
+            False,
+            f"Shell command exited {retry.returncode}. File '{missing_name}' "
+            f"WAS found in subdir '{rel_parent}/' (rubric expected it at cwd), "
+            f"but rubric still failed on its actual check. stderr: {retry_stderr}",
+        )
+    stderr_preview = _clean_shell_stderr(result.stderr or "", budget=400)
+    return (
+        False,
+        f"Shell command exited {result.returncode}. stderr: {stderr_preview}",
+    )
 
 
 def _score_response_contains(

@@ -35,6 +35,11 @@ from benchmarks.goku.scorers.llm_judge import (
 from benchmarks.goku.models import RubricItem, ScorerResult, TaskScore
 
 
+# Repo root resolved from this test file's location so tests are
+# portable across machines (test file: benchmarks/goku/tests/test_phase_fixes.py).
+_REPO_ROOT = Path(__file__).resolve().parents[3]
+
+
 # ─────────────────────────────────────────────────────────────────
 # G1 — _compute_category_breakdown
 # ─────────────────────────────────────────────────────────────────
@@ -1438,8 +1443,7 @@ def test_agent_video_keyframes_count_is_at_least_120():
     least 2 fpm. Was 8 — far too sparse to catch brief on-screen content."""
     import re
     src = Path(
-        "/Users/shraiykhaddar/Desktop/goku-benchmark/goku/benchmarks/goku/"
-        "run_infer.py"
+        str(_REPO_ROOT / "benchmarks/goku/run_infer.py")
     ).read_text()
     m = re.search(r"video_to_keyframes\([^)]*n_frames=(\d+)", src)
     assert m is not None, "video_to_keyframes call not found"
@@ -1555,7 +1559,7 @@ def test_run_batch_timeout_default_is_at_least_3600s():
     getting killed mid-conversation."""
     import re
     src = Path(
-        "/Users/shraiykhaddar/Desktop/goku-benchmark/goku/run_batch.sh"
+        str(_REPO_ROOT / "run_batch.sh")
     ).read_text()
     # Find the assignment line, ignore later --timeout flag overrides.
     m = re.search(r"^\s*RUN_TIMEOUT=(\d+)", src, re.MULTILINE)
@@ -1792,8 +1796,7 @@ def test_run_infer_main_eagerly_applies_httpx_patches():
     HTTP 422 (verified empirically on aman PDF task, 2026-05-22)."""
     import re
     src = Path(
-        "/Users/shraiykhaddar/Desktop/goku-benchmark/goku/benchmarks/goku/"
-        "run_infer.py"
+        str(_REPO_ROOT / "benchmarks/goku/run_infer.py")
     ).read_text()
     m = re.search(r"^def main\(\) -> None:\n([\s\S]+?)\n(?:^\S|^def\s)",
                   src, re.MULTILINE)
@@ -1830,8 +1833,7 @@ def test_rescore_main_eagerly_applies_httpx_patches():
     via LiteLLM and builds PDF blocks in _build_media_blocks)."""
     import re
     src = Path(
-        "/Users/shraiykhaddar/Desktop/goku-benchmark/goku/benchmarks/goku/"
-        "rescore.py"
+        str(_REPO_ROOT / "benchmarks/goku/rescore.py")
     ).read_text()
     m = re.search(r"^def main\(\) -> None:\n([\s\S]+?)\n(?:^\S|^def\s)",
                   src, re.MULTILINE)
@@ -1850,26 +1852,25 @@ def test_rescore_main_eagerly_applies_httpx_patches():
     )
 
 
-def test_run_infer_dormant_native_pdf_uses_container_path():
-    """Even though the native-PDF branch is dormant under the upstream
-    PyInstaller-bundled agent-server image (the container-side schema
-    can't be patched via Python sitecustomize), the branch must use the
-    container `/workspace/<basename>` path for DocumentContent — not the
-    host path — so that if/when the upstream gains native DocumentContent
-    support (or someone builds a forked agent-server), this code is
-    correct. Regression guard against silently re-introducing the
-    host-path bug."""
+def test_run_infer_no_documentcontent_construction():
+    """The dormant native-PDF DocumentContent branch was removed from
+    run_infer.py once we switched to the subsample+tool pipeline (which
+    works inside the existing TextContent/ImageContent schema and so
+    doesn't trip the container's PyInstaller-bundled validator).
+
+    Regression guard: if someone re-introduces a DocumentContent block
+    here, it will silently HTTP-422 every PDF task again because the
+    container-side schema patch can't be wired up (sdk_patches landmine,
+    see test_run_infer_main_eagerly_applies_httpx_patches).
+    """
     src = Path(
-        "/Users/shraiykhaddar/Desktop/goku-benchmark/goku/benchmarks/goku/"
-        "run_infer.py"
+        str(_REPO_ROOT / "benchmarks/goku/run_infer.py")
     ).read_text()
-    # Look at the DocumentContent construction context.
-    idx = src.find("DocumentContent(")
-    assert idx >= 0, "DocumentContent construction not found"
-    context = src[max(0, idx - 400):idx + 400]
-    assert "/workspace/" in context, (
-        "DocumentContent construction does not use /workspace/<basename> "
-        "for pdf_path. Container can't read host paths."
+    assert "DocumentContent(" not in src, (
+        "DocumentContent construction re-introduced in run_infer.py. The "
+        "upstream agent-server's bundled validator rejects this content "
+        "type with HTTP 422. Use the pdf_pipeline subsample+tool path "
+        "(GOKU_PDF_MODE=tool, default) instead."
     )
 
 
@@ -1879,8 +1880,7 @@ def test_sdk_patches_uses_discriminated_union():
     resolution but are fragile if a future TextContent / ImageContent
     weakens its `extra` config and accidentally matches DocumentContent."""
     src = Path(
-        "/Users/shraiykhaddar/Desktop/goku-benchmark/goku/benchmarks/utils/"
-        "sdk_patches.py"
+        str(_REPO_ROOT / "benchmarks/utils/sdk_patches.py")
     ).read_text()
     assert 'discriminator="type"' in src or "discriminator='type'" in src, (
         "sdk_patches.apply() must use Field(discriminator='type') for the "
@@ -1955,8 +1955,7 @@ def test_judge_video_gemini_block_uses_full_uri_format():
 
 def _run_infer_src() -> str:
     return Path(
-        "/Users/shraiykhaddar/Desktop/goku-benchmark/goku/benchmarks/goku/"
-        "run_infer.py"
+        str(_REPO_ROOT / "benchmarks/goku/run_infer.py")
     ).read_text()
 
 
@@ -2025,7 +2024,7 @@ def test_run_batch_cleanup_only_removes_stopped_containers():
     """
     import re
     src = Path(
-        "/Users/shraiykhaddar/Desktop/goku-benchmark/goku/run_batch.sh"
+        str(_REPO_ROOT / "run_batch.sh")
     ).read_text()
     # Find the cleanup_docker function body.
     m = re.search(r"^cleanup_docker\(\) \{([\s\S]+?)^\}", src, re.MULTILINE)
@@ -2067,7 +2066,7 @@ def test_run_batch_kill_ghost_still_exists():
     removed when softening cleanup_docker."""
     import re
     src = Path(
-        "/Users/shraiykhaddar/Desktop/goku-benchmark/goku/run_batch.sh"
+        str(_REPO_ROOT / "run_batch.sh")
     ).read_text()
     assert "kill_ghost_containers()" in src, (
         "kill_ghost_containers must remain as the time-bounded safety net "
@@ -2098,3 +2097,551 @@ def test_p2_install_failure_is_nonfatal():
     lines = block.splitlines()
     raises = [ln for ln in lines if ln.strip().startswith("raise ")]
     assert not raises, f"P2 must not raise on install failure; found: {raises}"
+
+
+# ─────────────────────────────────────────────────────────────────
+# PDF subsample+tool pipeline — bounds the turn-1 payload to ≤ ~2 MB
+# regardless of PDF page count, scales to 50+-page PDFs without
+# tripping Anthropic's 32 MB body cap or the 8 GB Docker container.
+# ─────────────────────────────────────────────────────────────────
+
+import os as _os
+import re as _re
+from unittest.mock import MagicMock as _MagicMock
+
+from benchmarks.goku import pdf_pipeline as _pdf_pipeline
+
+
+_PDF_04_DIR = Path(__file__).resolve().parents[3] / "dataset" / "pdf_04" / "data" / "input_files"
+_WRANGLER_PDF = _PDF_04_DIR / "jeep-wrangler-accessories.pdf"
+_CHEROKEE_PDF = _PDF_04_DIR / "2025-Jeep-Grand-Cherokee-Accessories.pdf"
+
+
+def _pdf_fixtures_available() -> bool:
+    return _WRANGLER_PDF.is_file() and _CHEROKEE_PDF.is_file()
+
+
+def test_pdf_pipeline_text_extraction_yields_part_numbers():
+    """The index must surface real part numbers from the wrangler catalog,
+    otherwise the agent has nothing to navigate. Specifically rubrics in
+    pdf_04 expect '77072498AB' to be discoverable."""
+    if not _pdf_fixtures_available():
+        return  # skip when running outside the repo (no dataset/)
+    pages = _pdf_pipeline._extract_per_page_text(_WRANGLER_PDF)
+    combined = "\n".join(pages)
+    # Page 7 in the rubric source mentions Tube Doors / 77072498AB.
+    # We only assert SOME page yielded extractable text containing a
+    # plausible Mopar part number — the exact page index varies by
+    # extractor heuristics and is not part of the contract.
+    assert any(p for p in pages), "every page returned empty — extractor broken"
+    assert _re.search(r"\b\d{8}[A-Z]{2}\b", combined), (
+        "no Mopar-style part number (8 digits + 2 letters) found in any page; "
+        "text extraction likely returned image fragments only"
+    )
+
+
+def test_pdf_pipeline_thumbnails_are_small():
+    """Every thumbnail must be ≤ 50 KB so the per-PDF total stays under
+    1 MB for 50-page PDFs. If this regresses, the turn-1 payload claim
+    in pdf_pipeline.py's docstring is violated."""
+    if not _pdf_fixtures_available():
+        return
+    thumbs = _pdf_pipeline._render_thumbnails(_WRANGLER_PDF, dpi=_pdf_pipeline.THUMBNAIL_DPI)
+    assert thumbs, "rendered zero thumbnails"
+    sizes_kb = [len(b) / 1024 for b in thumbs]
+    too_big = [s for s in sizes_kb if s > 50]
+    assert not too_big, (
+        f"{len(too_big)}/{len(thumbs)} thumbnails over 50 KB at DPI "
+        f"{_pdf_pipeline.THUMBNAIL_DPI}: max={max(sizes_kb):.0f} KB. "
+        "Either drop the DPI or the thumbnail size claim is wrong."
+    )
+
+
+def test_pdf_pipeline_turn1_payload_bounded_for_full_task():
+    """End-to-end: both pdf_04 PDFs together (35 pages) must produce a
+    turn-1 payload of ≤ 2 MB. This is the headline guarantee — failing
+    this means the fix doesn't fix the problem."""
+    if not _pdf_fixtures_available():
+        return
+    result = _pdf_pipeline.prepare_pdf_tool_mode(
+        [_WRANGLER_PDF, _CHEROKEE_PDF], workspace=None,
+    )
+    text_bytes = len(result.index_markdown.encode("utf-8")) + len(
+        result.agent_prompt_suffix.encode("utf-8")
+    )
+    image_bytes = sum(p.stat().st_size for p in result.thumbnail_paths)
+    total = text_bytes + image_bytes
+    assert total < 2_000_000, (
+        f"turn-1 payload is {total/1e6:.2f} MB — exceeds the 2 MB bound. "
+        f"text={text_bytes/1024:.0f} KB, thumbnails={image_bytes/1e6:.2f} MB"
+    )
+
+
+def test_pdf_pipeline_index_marks_image_only_pages():
+    """Pages with no extractable text should be tagged as 'image-only' so
+    the agent knows to fetch them at full DPI rather than expecting text
+    in the index."""
+    pages = ["", "real text on this page" * 5, ""]
+    md = _pdf_pipeline._build_index_markdown({"sample.pdf": pages})
+    assert "p1 (image-only" in md, "page 1 (empty text) not tagged image-only"
+    assert "p2 (" in md and "real text" in md, "page 2 should preview its text"
+    assert "p3 (image-only" in md, "page 3 (empty text) not tagged image-only"
+
+
+def test_pdf_pipeline_workspace_none_is_safe():
+    """Calling with workspace=None must not attempt any container-side
+    operation. Tests need to call this without a live container."""
+    if not _pdf_fixtures_available():
+        return
+    result = _pdf_pipeline.prepare_pdf_tool_mode([_WRANGLER_PDF], workspace=None)
+    assert result.index_markdown, "no index produced"
+    assert result.thumbnail_paths, "no thumbnails produced"
+    assert "/workspace/tools/pdf_page.py" in result.agent_prompt_suffix
+
+
+def test_pdf_pipeline_workspace_triggers_install_and_tools():
+    """With a mock workspace, prepare_pdf_tool_mode must fire one install
+    command and three tool-write commands. Failures of either are
+    non-fatal but must be attempted."""
+    if not _pdf_fixtures_available():
+        return
+    mock_ws = _MagicMock()
+    mock_ws.execute_command.return_value = _MagicMock(exit_code=0, stderr="", stdout="")
+    _pdf_pipeline.prepare_pdf_tool_mode([_WRANGLER_PDF], workspace=mock_ws)
+    # Look at the actual commands the mock saw.
+    cmds = [c.args[0] for c in mock_ws.execute_command.call_args_list]
+    # 1 mkdir for /workspace/tools + 3 cat heredocs for the scripts +
+    # 1 apt+pip install = 5 commands minimum.
+    assert any("apt-get install" in c and "tesseract-ocr" in c for c in cmds), (
+        f"missing apt-get install in: {cmds}"
+    )
+    assert any("pip install" in c and "pymupdf" in c for c in cmds), (
+        f"missing pymupdf pip install in: {cmds}"
+    )
+    assert any("pdf_page.py" in c for c in cmds), "pdf_page.py not written"
+    assert any("pdf_text.py" in c for c in cmds), "pdf_text.py not written"
+    assert any("pdf_search.py" in c for c in cmds), "pdf_search.py not written"
+
+
+def test_pdf_pipeline_install_failure_is_nonfatal():
+    """Same invariant as ffmpeg P2: install failure must not abort the
+    task. The agent can still navigate via the host-side index +
+    thumbnails; only the high-res fetch breaks."""
+    if not _pdf_fixtures_available():
+        return
+    mock_ws = _MagicMock()
+    mock_ws.execute_command.return_value = _MagicMock(
+        exit_code=1, stderr="apt-get: Connection refused", stdout="",
+    )
+    # Must not raise.
+    result = _pdf_pipeline.prepare_pdf_tool_mode([_WRANGLER_PDF], workspace=mock_ws)
+    assert result.index_markdown, "host-side index must still be produced on install failure"
+
+
+def test_run_infer_pdf_branch_gated_on_pdf_input():
+    """The new tool-mode dep install must NOT fire for image-only or
+    video-only tasks. This pins the gating so an image task doesn't
+    suddenly start `apt-get install`-ing tesseract."""
+    src = _run_infer_src()
+    # Locate the new install hook.
+    assert "install_pdf_deps_in_container" in src, (
+        "PDF dep install hook missing from run_infer.py"
+    )
+    # The line that calls it must be inside an `if _has_pdf_input` branch.
+    install_line_idx = src.index("install_pdf_deps_in_container(workspace)")
+    # Walk backwards to the nearest `if ` at the start of a line; that's
+    # the immediate guard.
+    preceding = src[:install_line_idx]
+    last_if = preceding.rfind("\n        if ")
+    assert last_if != -1, "no `if` guard before install_pdf_deps_in_container call"
+    guard_line = preceding[last_if:].splitlines()[1].strip()
+    assert "_has_pdf_input" in guard_line, (
+        f"install hook must be gated by _has_pdf_input; got: {guard_line!r}"
+    )
+    assert "GOKU_PDF_MODE" in guard_line, (
+        f"install hook must respect GOKU_PDF_MODE env var; got: {guard_line!r}"
+    )
+
+
+def test_run_infer_pdf_tool_mode_default():
+    """If an operator forgets to set GOKU_PDF_MODE, tool mode must be the
+    default. The whole point of the fix is that it's on by default."""
+    src = _run_infer_src()
+    # Find the env var read in run_infer.
+    for line in src.splitlines():
+        if "GOKU_PDF_MODE" in line and "os.environ" in line and "tool" in line:
+            assert '"tool"' in line, (
+                f"default for GOKU_PDF_MODE must be 'tool' (not inline); "
+                f"got: {line!r}"
+            )
+            return
+    raise AssertionError("could not find GOKU_PDF_MODE default in run_infer.py")
+
+
+def test_run_infer_inline_mode_still_reachable():
+    """The old inline render path must remain wired, for ≤5-page PDFs
+    and smoke tests. GOKU_PDF_MODE=inline should still drive
+    pdf_to_page_images."""
+    src = _run_infer_src()
+    # Find the inline branch.
+    assert 'pdf_mode == "inline"' in src, "inline mode branch missing"
+    inline_idx = src.index('pdf_mode == "inline"')
+    # The inline branch should still import pdf_to_page_images.
+    chunk = src[inline_idx:inline_idx + 1500]
+    assert "pdf_to_page_images" in chunk, (
+        "inline mode branch must still call pdf_to_page_images for legacy "
+        "/ small-PDF cases"
+    )
+
+
+def test_judge_json_repair_fallback_handles_unescaped_quotes():
+    """Gemini 3.5 Flash emits JSON with unescaped inner double-quotes or
+    stray newlines inside `reasoning` strings (verified on pdf_04
+    rubric #4, 2026-05-22). `response_format: json_object` doesn't fully
+    prevent this. The scorer must try json-repair before falling back to
+    'Judge returned invalid JSON' → passed=False.
+
+    This is a behavior test on the actual scorer: build a synthetic
+    `_score_llm_judge_single` call where the LLM emits malformed JSON;
+    assert the scorer recovers the criteria_met value via json-repair."""
+    from unittest.mock import patch as _patch, MagicMock as _MM
+    from benchmarks.goku.scorers import llm_judge as _llm_judge
+    from benchmarks.goku.models import RubricItem as _RubricItem
+
+    # Synthetic malformed JSON modelled on the actual gemini #4 failure.
+    # Note the unescaped inner double-quote that breaks strict json.loads.
+    malformed = (
+        '{"criteria_met": true, "reasoning": "Agent identified "MJL20US4_039" '
+        'as Tube Doors / 77072498AB. Correct."}'
+    )
+
+    mock_response = _MM()
+    mock_response.choices = [_MM(message=_MM(content=malformed))]
+    mock_response.model = "gemini/gemini-3.5-flash"
+
+    rubric = _RubricItem(
+        number=4, type="response_criteria", category="CORRECTNESS",
+        points=5, importance="mandatory",
+        criterion="agent identified MJL20US4_039 correctly",
+    )
+
+    with _patch.object(_llm_judge, "litellm") as mock_litellm:
+        mock_litellm.completion.return_value = mock_response
+        mock_litellm.completion_cost.return_value = 0.001
+        result = _llm_judge._score_llm_judge_single(
+            item=rubric,
+            response="agent output",
+            file_contents="",
+            trajectory="",
+            judge_model="gemini/gemini-3.5-flash",
+            judge_api_key="fake",
+        )
+
+    assert result.passed is True, (
+        "Scorer must recover criteria_met=true from malformed JSON via "
+        f"json-repair fallback. Got passed={result.passed} with rationale: "
+        f"{result.judge_rationale!r}"
+    )
+
+
+def test_judge_max_tokens_fits_gemini_thinking_budget():
+    """Gemini 3.5 Flash spends "thinking" tokens INSIDE the max_tokens
+    budget before emitting the final JSON. For cross-modal reasoning on
+    dense PDFs (e.g. pdf_04 rubric #4 — image-label → part-number across
+    two catalogs), thinking alone can use 4-6K tokens.
+
+    At max_tokens=4096 the JSON gets truncated mid-rationale and the
+    scorer falls back to 'Judge returned invalid JSON' → passed=False,
+    silently penalising correct judgements. Verified empirically on
+    pdf_04 / gemini-3.1 (2026-05-22).
+
+    Regression guard: keep max_tokens ≥ 8192 in the judge completion call
+    so this class of false-fail can't recur."""
+    src = Path(
+        str(_REPO_ROOT / "benchmarks/goku/scorers/llm_judge.py")
+    ).read_text()
+    # Find the max_tokens value in the completion_kwargs block.
+    import re as _re_mod
+    kw_idx = src.index("completion_kwargs: dict = {")
+    block = src[kw_idx:kw_idx + 600]
+    m = _re_mod.search(r'"max_tokens":\s*(\d+)', block)
+    assert m, f"max_tokens not found in judge completion_kwargs block: {block!r}"
+    mt = int(m.group(1))
+    assert mt >= 8192, (
+        f"judge max_tokens is {mt}; must be ≥8192 to accommodate Gemini 3.5 "
+        f"Flash thinking budget on dense-PDF cross-modal rubrics. Bumping "
+        f"this back down will re-introduce the silent invalid-JSON failures."
+    )
+
+
+def test_pdf_prompt_suffix_warns_about_image_dim_cap():
+    """The agent's turn-1 prompt suffix MUST warn about the ≤2000-px image
+    dimension cap and steer it toward `pdf_page.py --dpi <N>` (which
+    auto-clamps) instead of direct pymupdf/PIL high-zoom rendering.
+
+    Without this warning, claude on pdf_01 used `pymupdf.Matrix(4, 4)` to
+    zoom into UI details, produced a 6123x2382 image, cropped a 2100x850
+    region, and the next API call hit Anthropic's many-image dim cap
+    (verified empirically 2026-05-23 00:04). The warning fixes that class
+    of failure across all PDF tasks for any model with claude-like
+    "write-my-own-Python" behavior."""
+    suffix = _pdf_pipeline._build_prompt_suffix(
+        {"sample.pdf": ["page 1 text"]},
+        [Path("/workspace/sample.pdf")],
+    )
+    assert "2000 px" in suffix, "suffix must explicitly state the 2000-px cap"
+    assert "pdf_page.py" in suffix and "--dpi" in suffix, (
+        "suffix must steer the agent to pdf_page.py with --dpi as the safe path"
+    )
+    assert "auto-clamp" in suffix.lower() or "scale back" in suffix.lower(), (
+        "suffix must explain that pdf_page.py handles the clamp automatically"
+    )
+    # Must NOT discourage legitimate text extraction via pymupdf
+    assert "text" in suffix.lower() and "pymupdf" in suffix.lower(), (
+        "suffix must clarify the cap is about *rendered images*, not all "
+        "pymupdf use (text extraction is fine)"
+    )
+
+
+# ─────────────────────────────────────────────────────────────────
+# P0 — shell_succeeds_real subdir fallback
+# ─────────────────────────────────────────────────────────────────
+
+def test_p0_shell_scorer_direct_pass_unchanged():
+    """The status quo path — rubric file lives at cwd — must still PASS
+    on the same first try, with the SAME rationale shape (no subdir
+    annotation). Regression guard for the 99% common case."""
+    from benchmarks.goku.scorers.deterministic import _score_shell_succeeds_real
+    from benchmarks.goku.models import RubricItem
+    with tempfile.TemporaryDirectory() as td:
+        outdir = Path(td)
+        (outdir / "data.json").write_text('{"x": 1}')
+        item = RubricItem(
+            number=1, type="shell_succeeds_real", category="CORRECTNESS",
+            points=5, importance="mandatory", criterion="x is 1",
+            raw_shell=r"""python3 -c "import json; assert json.load(open('data.json'))['x']==1" """,
+        )
+        passed, rationale = _score_shell_succeeds_real(item, outdir, "")
+        assert passed is True
+        assert "resolved via subdir" not in rationale  # took the direct path
+
+
+def test_p0_shell_scorer_real_failure_unchanged():
+    """If the rubric assertion ACTUALLY fails (not a file_path issue), the
+    fallback must NOT mask the real failure. Regression guard against
+    accidentally turning genuine fails into passes."""
+    from benchmarks.goku.scorers.deterministic import _score_shell_succeeds_real
+    from benchmarks.goku.models import RubricItem
+    with tempfile.TemporaryDirectory() as td:
+        outdir = Path(td)
+        (outdir / "data.json").write_text('{"x": 999}')  # wrong value
+        item = RubricItem(
+            number=1, type="shell_succeeds_real", category="CORRECTNESS",
+            points=5, importance="mandatory", criterion="x is 1",
+            raw_shell=r"""python3 -c "import json; assert json.load(open('data.json'))['x']==1" """,
+        )
+        passed, rationale = _score_shell_succeeds_real(item, outdir, "")
+        assert passed is False, "real assertion failure must stay failed"
+        assert "AssertionError" in rationale
+
+
+def test_p0_shell_scorer_file_truly_missing_unchanged():
+    """If the file genuinely doesn't exist anywhere, the fallback shouldn't
+    invent a pass. Stays failed with the original FileNotFoundError."""
+    from benchmarks.goku.scorers.deterministic import _score_shell_succeeds_real
+    from benchmarks.goku.models import RubricItem
+    with tempfile.TemporaryDirectory() as td:
+        outdir = Path(td)
+        item = RubricItem(
+            number=1, type="shell_succeeds_real", category="CORRECTNESS",
+            points=5, importance="mandatory", criterion="data.json exists",
+            raw_shell=r"""python3 -c "import json; json.load(open('data.json'))" """,
+        )
+        passed, rationale = _score_shell_succeeds_real(item, outdir, "")
+        assert passed is False
+        assert "FileNotFoundError" in rationale or "No such file" in rationale
+
+
+def test_p0_shell_scorer_subdir_fallback_kicks_in():
+    """The new behavior: agent saved 'data.json' into a 'results/' subdir.
+    Bare `open('data.json')` from cwd fails, but our fallback finds the
+    file in the subdir and re-runs from that subdir. Should PASS with a
+    clear annotation in the rationale."""
+    from benchmarks.goku.scorers.deterministic import _score_shell_succeeds_real
+    from benchmarks.goku.models import RubricItem
+    with tempfile.TemporaryDirectory() as td:
+        outdir = Path(td)
+        sub = outdir / "results"
+        sub.mkdir()
+        (sub / "data.json").write_text('{"x": 1}')
+        item = RubricItem(
+            number=1, type="shell_succeeds_real", category="CORRECTNESS",
+            points=5, importance="mandatory", criterion="x is 1",
+            raw_shell=r"""python3 -c "import json; assert json.load(open('data.json'))['x']==1" """,
+        )
+        passed, rationale = _score_shell_succeeds_real(item, outdir, "")
+        assert passed is True, f"subdir fallback failed: {rationale}"
+        assert "subdir" in rationale.lower()
+        assert "results" in rationale
+
+
+def test_p0_shell_scorer_subdir_with_assertion_fail_does_not_falsely_pass():
+    """If the file IS in a subdir but the assertion would still fail
+    (e.g., wrong value), the fallback must report failure — NOT a false
+    pass just because it found the file."""
+    from benchmarks.goku.scorers.deterministic import _score_shell_succeeds_real
+    from benchmarks.goku.models import RubricItem
+    with tempfile.TemporaryDirectory() as td:
+        outdir = Path(td)
+        sub = outdir / "results"
+        sub.mkdir()
+        (sub / "data.json").write_text('{"x": 999}')  # wrong value
+        item = RubricItem(
+            number=1, type="shell_succeeds_real", category="CORRECTNESS",
+            points=5, importance="mandatory", criterion="x is 1",
+            raw_shell=r"""python3 -c "import json; assert json.load(open('data.json'))['x']==1" """,
+        )
+        passed, rationale = _score_shell_succeeds_real(item, outdir, "")
+        assert passed is False, "wrong value must NOT pass even with subdir fallback"
+
+
+def test_p0_shell_scorer_only_bare_filenames_trigger_fallback():
+    """If the rubric references 'subdir/foo.json' explicitly, that's a path
+    the rubric author wrote on purpose — don't trigger the fallback for
+    nested paths. (Guard against widening behavior beyond what we want.)"""
+    from benchmarks.goku.scorers.deterministic import _score_shell_succeeds_real
+    from benchmarks.goku.models import RubricItem
+    with tempfile.TemporaryDirectory() as td:
+        outdir = Path(td)
+        (outdir / "elsewhere").mkdir()
+        (outdir / "elsewhere" / "data.json").write_text('{"x": 1}')
+        # Rubric writes "data/data.json" but we only have "elsewhere/data.json"
+        item = RubricItem(
+            number=1, type="shell_succeeds_real", category="CORRECTNESS",
+            points=5, importance="mandatory", criterion="x is 1",
+            raw_shell=r"""python3 -c "import json; json.load(open('data/data.json'))" """,
+        )
+        passed, rationale = _score_shell_succeeds_real(item, outdir, "")
+        # The error message references 'data/data.json' (with slash) — our
+        # regex skips it, so we don't go searching with the wrong filename.
+        assert passed is False
+
+
+# ─────────────────────────────────────────────────────────────────
+# P1 — cumulative output.jsonl.ever_seen ledger
+# ─────────────────────────────────────────────────────────────────
+
+def test_p1_ever_seen_appends_new_entries():
+    """First call: every entry from live output.jsonl gets appended to
+    ever_seen. Second call: no new entries (idempotent)."""
+    from benchmarks.goku.scripts.clean_resume_state import _append_to_ever_seen
+    with tempfile.TemporaryDirectory() as td:
+        live = Path(td) / "output.jsonl"
+        ever = Path(td) / "output.jsonl.ever_seen"
+        live.write_text(
+            '{"instance_id": "task_a", "attempt": 1, "x": 1}\n'
+            '{"instance_id": "task_b", "attempt": 1, "x": 2}\n'
+        )
+        n1 = _append_to_ever_seen(live, ever)
+        n2 = _append_to_ever_seen(live, ever)
+        assert n1 == 2, f"first call should append 2; got {n1}"
+        assert n2 == 0, f"second call should append 0 (idempotent); got {n2}"
+
+
+def test_p1_ever_seen_preserves_entries_across_strip_cycles():
+    """Simulate two --rerun cycles. After cycle 2, the live file no longer
+    has the entries that were stripped, BUT ever_seen still has them.
+    This is the whole point of P1."""
+    from benchmarks.goku.scripts.clean_resume_state import (
+        strip_task_from_jsonl, _append_to_ever_seen
+    )
+    with tempfile.TemporaryDirectory() as td:
+        live = Path(td) / "output.jsonl"
+        ever = Path(td) / "output.jsonl.ever_seen"
+        live.write_text(
+            '{"instance_id": "task_a", "attempt": 1, "x": 1}\n'
+            '{"instance_id": "task_b", "attempt": 1, "x": 2}\n'
+        )
+        # Strip A.
+        strip_task_from_jsonl(live, {"task_a"}, dry_run=False, archive_suffix=".archive_test1")
+        # After strip: live only has B
+        assert '"task_a"' not in live.read_text()
+        # But ever_seen has BOTH
+        ever_content = ever.read_text()
+        assert '"task_a"' in ever_content, "ever_seen lost task_a!"
+        assert '"task_b"' in ever_content, "ever_seen lost task_b!"
+        # Now strip B.
+        strip_task_from_jsonl(live, {"task_b"}, dry_run=False, archive_suffix=".archive_test2")
+        # Live is empty.
+        assert live.read_text().strip() == ""
+        # ever_seen still has both.
+        ever_content = ever.read_text()
+        assert '"task_a"' in ever_content
+        assert '"task_b"' in ever_content
+
+
+def test_p1_rescore_falls_back_to_ever_seen():
+    """rescore.py must look in output.jsonl.ever_seen when output.jsonl
+    doesn't have the entry. Regression guard for the actual rescue
+    behavior (not just the ledger maintenance)."""
+    src = Path(
+        str(_REPO_ROOT / "benchmarks/goku/rescore.py")
+    ).read_text()
+    assert "ever_seen" in src, (
+        "rescore.py must reference the ever_seen ledger for fallback. "
+        "Without it, --rerun-stripped entries become unrescore-able."
+    )
+    # The fallback path must include a clear log message so operators
+    # can see when the rescue actually fires.
+    assert "Recovered" in src and "ever_seen" in src, (
+        "rescore.py must log when it recovers an entry from ever_seen "
+        "(otherwise silent rescue is confusing)"
+    )
+
+
+def test_pdf_page_tool_clamps_to_2000_pixels():
+    """The pdf_page.py tool MUST clamp output to 2000 px on the longest
+    dimension. Anthropic rejects many-image requests where any image
+    exceeds this cap with HTTP 400 invalid_request_error — verified
+    empirically on pdf_04 / claude-opus 2026-05-22 22:47:58.
+    A letter-size page at DPI 200 is 1700x2200 — exceeds the cap.
+    Default DPI must be set so common page sizes naturally fit, and
+    the script must derive an effective DPI from page size to clamp."""
+    script = _pdf_pipeline._TOOL_PDF_PAGE
+    # The script must reference the 2000-px cap.
+    assert "2000" in script, "pdf_page.py must reference the 2000-px cap"
+    # Default DPI ≤ 180 so an 11" tall page stays under 2000 px (11*180=1980).
+    import re as _re_mod
+    m = _re_mod.search(r"--dpi.*default=(\d+)", script)
+    assert m, "could not find --dpi default in pdf_page.py"
+    default_dpi = int(m.group(1))
+    assert default_dpi <= 180, (
+        f"pdf_page.py default DPI is {default_dpi}; must be ≤180 so a "
+        f"standard 11\"-tall page (11×{default_dpi}={11*default_dpi} px) "
+        f"stays under Anthropic's 2000-px many-image dim cap"
+    )
+    # And the script must have the per-page max-safe-dpi clamp logic.
+    assert "max_safe_dpi" in script, (
+        "pdf_page.py must clamp DPI per-page based on the page's natural "
+        "dimensions, not just trust the user-passed --dpi"
+    )
+
+
+def test_run_infer_image_video_paths_untouched():
+    """Smoke regression: the image and video classification branches in
+    the input_files loop must still look the way they did before the
+    PDF pipeline change. If someone refactors them later we want this
+    test to fire so the change is intentional."""
+    src = _run_infer_src()
+    # The image extension check.
+    assert '(\"jpg\", \"jpeg\", \"png\", \"gif\", \"webp\", \"bmp\")' in src, (
+        "image extension tuple changed; verify image-only tasks still work"
+    )
+    # The video extension check.
+    assert '(\"mp4\", \"mov\", \"webm\", \"avi\", \"mkv\")' in src, (
+        "video extension tuple changed; verify video-only tasks still work"
+    )
+    # video_to_keyframes call still present.
+    assert "video_to_keyframes(file_path, n_frames=120)" in src, (
+        "video keyframe extraction call changed; verify video tasks still work"
+    )
