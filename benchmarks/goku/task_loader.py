@@ -476,6 +476,28 @@ def load_task(task_dir: Path) -> GokuEvalInstance:
                 "Backfill the `source` field before next vendor delivery.",
                 task_key, last.number, last.category, last.type,
             )
+        # V3 (2026-05-26) policy: rubric points must be POSITIVE. Old
+        # hallucination rubrics used negative points (-5) with type
+        # `response_not_criteria`; new spec says rewrite as positive
+        # `response_criteria` whose criterion asserts what the agent
+        # MUST satisfy ("agent only identifies items actually visible,
+        # does not fabricate ..."). Existing negative-point rubrics
+        # still score correctly (backward compat) but are flagged so
+        # authors can migrate.
+        if last.points is not None and last.points < 0:
+            suggested_type = (
+                "response_criteria"
+                if last.type == "response_not_criteria" else last.type
+            )
+            logger.warning(
+                "Task %s: rubric #%d has negative points (%d). Per V3 spec "
+                "(2026-05-26), all rubrics must use POSITIVE point values. "
+                "Convert: type %s → %s, points %d → %d, and rewrite the "
+                "criterion as a positive assertion the agent must satisfy. "
+                "Scoring still works for back-compat; please migrate.",
+                task_key, last.number, last.points,
+                last.type, suggested_type, last.points, abs(last.points),
+            )
 
     if not rubric_items:
         raise ValueError(

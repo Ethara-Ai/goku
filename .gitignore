@@ -253,3 +253,22 @@ _archive_pre_rename_*/
 .llm_config.zip
 .llm_config*.zip
 *.zip
+
+# Local-only operational tooling (delivery cleanup for ad-hoc hand-edits)
+benchmarks/goku/scripts/clean_delivery.py
+benchmarks/goku/tests/test_clean_delivery.py
+
+# AWS credentials / secrets — NEVER commit. Live in env vars or ~/.aws/.
+.aws/
+aws_credentials
+aws_credentials.*
+*aws_credentials*
+*.aws.json
+secrets/
+secrets.*
+*.secret
+
+# Local-only run artifacts (pidfiles, log backups, watcher outputs from run_batch.sh)
+task*_*.pid
+*.watcher
+*.log.*.bak

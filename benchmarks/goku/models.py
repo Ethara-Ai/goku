@@ -54,6 +54,19 @@ class RubricItem(BaseModel):
     source: dict[str, Any] | list[dict[str, Any]] | None = None  # factuality
 
 
+class JudgeVerdict(BaseModel):
+    """Per-judge verdict for a single rubric item (council mode only)."""
+
+    judge_model: str
+    passed: bool
+    judge_rationale: str
+    judge_cost_usd: float = Field(default=0.0, ge=0.0)
+    # Populated when a judge call fails (timeout, API error, etc.) — its
+    # vote is treated as a conservative `passed=False` in aggregation, but
+    # the reason is preserved so split verdicts are debuggable.
+    error: str | None = None
+
+
 class ScorerResult(BaseModel):
     """Result of scoring a single rubric item."""
 
@@ -64,8 +77,33 @@ class ScorerResult(BaseModel):
     # USD cost of the LLM judge call for this item (0 for deterministic types
     # like probe_* / shell_* / response_contains / response_regex_present).
     # Populated by LiteLLM's `response_cost` for response_criteria /
-    # response_not_criteria items.
+    # response_not_criteria items. In council mode this is the SUM across
+    # all judges that contributed.
     judge_cost_usd: float = Field(default=0.0, ge=0.0)
+
+    # Council-mode fields (None for single-judge runs — preserves backward
+    # compatibility with the existing scores.jsonl schema). Populated only
+    # when the rubric was scored via score_llm_judge_council().
+    per_judge_verdicts: list[JudgeVerdict] | None = None
+    vote: str | None = Field(
+        default=None,
+        description="Council pass vote ratio, e.g. '2/3'. None in single-judge mode.",
+    )
+    disagreement: int | None = Field(
+        default=None,
+        ge=0,
+        description=(
+            "Council split count: 0 if all judges agreed, 1+ for any split. "
+            "None in single-judge mode."
+        ),
+    )
+    consensus: Literal["unanimous", "majority"] | None = Field(
+        default=None,
+        description=(
+            "Council consensus type: 'unanimous' iff all judges agreed; "
+            "'majority' iff 2/3 (or N/N-1) agreed. None in single-judge mode."
+        ),
+    )
 
 
 class TaskScore(BaseModel):

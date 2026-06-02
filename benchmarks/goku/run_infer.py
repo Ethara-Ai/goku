@@ -31,7 +31,11 @@ from benchmarks.goku.scorers.deterministic import (
     DETERMINISTIC_TYPES,
     score_deterministic,
 )
-from benchmarks.goku.scorers.llm_judge import LLM_JUDGE_TYPES, score_llm_judge
+from benchmarks.goku.scorers.llm_judge import (
+    LLM_JUDGE_TYPES,
+    score_llm_judge,
+    score_llm_judge_council,
+)
 from benchmarks.goku.scoring import compute_task_score, write_scores_jsonl
 from benchmarks.goku.task_loader import discover_tasks
 from benchmarks.utils.args_parser import get_parser
@@ -530,12 +534,46 @@ class GokuEvaluation(Evaluation):
         #   * Other  → uploaded to workspace earlier; agent can shell-read.
         image_urls: list[str] = []
         pdf_paths: list[str] = []
+        # Image input paths gathered first so we can decide between inline
+        # base64 (the legacy path for ≤20 images) and S3-hosted URLs (the
+        # many-image path that fits Anthropic/Gemini body caps and survives
+        # multi-turn agent conversations).
+        agent_image_inputs: list[str] = [
+            p for p in input_files
+            if os.path.exists(p)
+            and p.rsplit(".", 1)[-1].lower() in ("jpg", "jpeg", "png", "gif", "webp", "bmp")
+        ]
+        from benchmarks.goku.image_hosting import (
+            should_use_url_hosting, upload_task_images, s3_hosting_configured,
+        )
+        from pathlib import Path as _Path
+        use_url_mode = should_use_url_hosting([_Path(p) for p in agent_image_inputs])
+        if use_url_mode:
+            if not s3_hosting_configured():
+                raise RuntimeError(
+                    f"Task has {len(agent_image_inputs)} images (>20) and so "
+                    f"requires S3 URL hosting, but AWS_REGION + AWS_BUCKET "
+                    f"(or GOKU_S3_BUCKET) env vars are not set. Either set "
+                    f"them (see benchmarks/goku/image_hosting.py docstring) "
+                    f"or set GOKU_IMAGE_MODE=inline to force the legacy path."
+                )
+            hosted = upload_task_images(
+                image_paths=[_Path(p) for p in agent_image_inputs],
+                task_key=instance.id,
+            )
+            image_urls.extend(hosted.urls)
+            logger.info(
+                "Many-image mode: hosted %d images to S3 (run_prefix=%s)",
+                len(hosted.urls), hosted.run_prefix,
+            )
         for file_path in input_files:
             if not os.path.exists(file_path):
                 continue
             ext = file_path.rsplit(".", 1)[-1].lower() if "." in file_path else ""
             if ext in ("jpg", "jpeg", "png", "gif", "webp", "bmp"):
-                image_urls.append(_image_to_base64_url(file_path))
+                # Skip — already handled above (inline OR url-mode)
+                if not use_url_mode:
+                    image_urls.append(_image_to_base64_url(file_path))
             elif ext == "pdf":
                 pdf_paths.append(file_path)
             elif ext in ("mp4", "mov", "webm", "avi", "mkv"):
@@ -693,6 +731,25 @@ class GokuEvaluation(Evaluation):
                 result = score_deterministic(item, output_dir, response_text)
             elif item.type in LLM_JUDGE_TYPES:
                 details = self.metadata.details or {}
+                # Council mode dispatch — populated by the CLI layer when
+                # --judge-llm-configs (plural) is provided. Mutually
+                # exclusive with single-judge mode below.
+                council_models = details.get("judge_council_models")
+                if council_models:
+                    result = score_llm_judge_council(
+                        item=item,
+                        response=response_text,
+                        file_contents=file_contents,
+                        trajectory=trajectory,
+                        judge_models=council_models,
+                        judge_api_keys=details.get("judge_council_api_keys"),
+                        aws_region_names=details.get("judge_council_regions"),
+                        input_image_paths=instance.data.get("input_files") or [],
+                        output_media_paths=output_media_paths,
+                        task_key=instance.id,
+                    )
+                    results.append(result)
+                    continue
                 judge_model = details.get("judge_model") or os.getenv(
                     "GOKU_JUDGE_MODEL",
                     "gemini/gemini-3.5-flash",
@@ -749,6 +806,10 @@ class GokuEvaluation(Evaluation):
                     # Pre-fix the judge only saw "(binary, N bytes)"
                     # placeholders and had to bluff.
                     output_media_paths=output_media_paths,
+                    # Used by the judge's many-image S3-URL short-circuit
+                    # to reuse the agent's already-uploaded images via
+                    # the in-process image_hosting cache (no re-upload).
+                    task_key=instance.id,
                 )
             else:
                 raise ValueError(
@@ -843,16 +904,46 @@ class GokuEvaluation(Evaluation):
 
         Downloads all files recursively from /workspace/, excluding the
         original input files that were uploaded.
+
+        Bug fix 2026-06-01: exclusion now matches FULL REMOTE PATHS
+        (``/workspace/<file_name>``), not just basenames. The prior basename
+        match was too aggressive — when an agent's task is to ORGANIZE input
+        images into subfolders (e.g. ``/workspace/result/duplicate/i64.jpeg``),
+        the output files end up with the SAME basenames as the inputs and
+        were silently filtered out. Result: only files with non-collising
+        basenames (e.g. ``hovercraft_index.json``) survived, breaking the
+        whole task-100images class of organize/sort tasks where evidence of
+        agent work depends on per-image file placement.
         """
         output_dir = Path(tempfile.mkdtemp(prefix=f"goku_{instance_id}_"))
-        exclude_names = set(input_file_names or [])
+        # Exclude ONLY the input copies at the workspace root, not files
+        # the agent moved/copied INTO subdirectories under /workspace/.
+        exclude_paths = {f"/workspace/{n}" for n in (input_file_names or [])}
 
         max_files = int(os.getenv("GOKU_MAX_DOWNLOAD_FILES", "2000"))
         try:
+            # Path exclusions (find-side filtering, before the per-path
+            # basename check). Existing: conversations/, .openhands/.
+            # Added 2026-06-01 alongside the basename→full-path fix to
+            # block transient artifacts agents may produce in /workspace/
+            # (pip-installed packages, model weight caches, build trees,
+            # editor artifacts) — these are not agent OUTPUT and would
+            # otherwise bloat eval_outputs/ and dilute scoring.
             result = workspace.execute_command(
                 f"find /workspace -type f "
                 f"! -path '/workspace/conversations/*' "
                 f"! -path '/workspace/.openhands/*' "
+                f"! -path '/workspace/.venv/*' "
+                f"! -path '/workspace/venv/*' "
+                f"! -path '/workspace/env/*' "
+                f"! -path '/workspace/.cache/*' "
+                f"! -path '/workspace/.local/*' "
+                f"! -path '/workspace/node_modules/*' "
+                f"! -path '*/__pycache__/*' "
+                f"! -path '*/.pytest_cache/*' "
+                f"! -path '*/.mypy_cache/*' "
+                f"! -path '*/.ruff_cache/*' "
+                f"! -name '*.pyc' "
                 f"2>/dev/null | head -{max_files + 1}"
             )
             stdout = (
@@ -872,8 +963,11 @@ class GokuEvaluation(Evaluation):
                     )
                     remote_paths_raw = remote_paths_raw[:max_files]
                 for remote_path in remote_paths_raw:
-                    file_name = os.path.basename(remote_path)
-                    if file_name in exclude_names:
+                    # Match by FULL remote path, not basename — see docstring.
+                    # Files at /workspace/iN.jpeg (input copies) are excluded;
+                    # files at /workspace/result/<cat>/iN.jpeg (agent output)
+                    # are preserved.
+                    if remote_path in exclude_paths:
                         continue
                     rel_path = remote_path.replace("/workspace/", "", 1)
                     local_path = output_dir / rel_path
@@ -981,8 +1075,25 @@ def main() -> None:
         default=None,
         help="Path to LLM config JSON for the judge model (e.g., .llm_config/gemini-3.5-flash.json)",
     )
+    parser.add_argument(
+        "--judge-llm-configs",
+        type=str,
+        default=None,
+        help=(
+            "Comma-separated paths to LLM config JSONs for a judge COUNCIL "
+            "(e.g., .llm_config/claude-sonnet-4.6.json,.llm_config/gpt-5.json,"
+            ".llm_config/gemini-3.5-flash.json). When ≥2 configs are given, "
+            "each LLM-judged rubric is scored by all judges in parallel and "
+            "the verdict is majority-vote. Mutually exclusive with --judge-llm-config."
+        ),
+    )
     parser.set_defaults(**INFER_DEFAULTS)
     args = parser.parse_args()
+    if args.judge_llm_config and args.judge_llm_configs:
+        parser.error(
+            "Specify either --judge-llm-config (single judge) OR "
+            "--judge-llm-configs (council), not both."
+        )
 
     # Handle single task selection
     instance_select_file = None
@@ -1056,9 +1167,24 @@ def main() -> None:
         llm.model,
     )
 
-    # Load judge LLM config if provided
+    # Load judge LLM config(s) — single judge OR council.
     judge_llm = None
-    if args.judge_llm_config:
+    judge_council_llms: list = []
+    if args.judge_llm_configs:
+        # Council mode: comma-separated paths.
+        paths = [p.strip() for p in args.judge_llm_configs.split(",") if p.strip()]
+        if len(paths) < 2:
+            raise ValueError(
+                f"--judge-llm-configs requires ≥2 paths; got {len(paths)}. "
+                f"Use --judge-llm-config for single-judge scoring."
+            )
+        judge_council_llms = [load_llm_config(p) for p in paths]
+        logger.info(
+            "Using judge COUNCIL (%d judges): %s",
+            len(judge_council_llms),
+            ", ".join(j.model for j in judge_council_llms),
+        )
+    elif args.judge_llm_config:
         judge_llm = load_llm_config(args.judge_llm_config)
         logger.info("Using judge LLM config: %s", judge_llm.model)
     else:
@@ -1080,6 +1206,52 @@ def main() -> None:
             eval_note=args.note,
         )
 
+        # Build judge details for the metadata. In council mode, expose a
+        # parallel list of model strings + api keys + regions for the
+        # per-rubric loop to consume; single-judge mode keeps the legacy
+        # scalar fields populated.
+        if judge_council_llms:
+            council_details = {
+                "judge_council_models": [j.model for j in judge_council_llms],
+                "judge_council_api_keys": [
+                    (j.api_key.get_secret_value()
+                     if hasattr(j.api_key, "get_secret_value")
+                     else j.api_key) if j.api_key else None
+                    for j in judge_council_llms
+                ],
+                "judge_council_regions": [
+                    j.aws_region_name for j in judge_council_llms
+                ],
+                "judge_council_display_names": [
+                    os.path.splitext(os.path.basename(p))[0]
+                    for p in (args.judge_llm_configs or "").split(",")
+                ],
+                # Keep legacy scalar fields None so the per-rubric branch
+                # can detect council mode via presence of the list field.
+                "judge_model": None,
+                "judge_api_key": None,
+                "judge_region": None,
+                "judge_model_display_name": None,
+            }
+        else:
+            council_details = {
+                "judge_council_models": None,
+                "judge_council_api_keys": None,
+                "judge_council_regions": None,
+                "judge_council_display_names": None,
+                "judge_model": judge_llm.model if judge_llm else None,
+                "judge_api_key": (
+                    judge_llm.api_key.get_secret_value()
+                    if (judge_llm and hasattr(judge_llm.api_key, "get_secret_value"))
+                    else (judge_llm.api_key if judge_llm else None)
+                ),
+                "judge_region": (judge_llm.aws_region_name if judge_llm else None),
+                "judge_model_display_name": (
+                    os.path.splitext(os.path.basename(args.judge_llm_config))[0]
+                    if args.judge_llm_config else None
+                ),
+            }
+
         metadata = EvalMetadata(
             llm=llm,
             dataset="goku",
@@ -1089,18 +1261,12 @@ def main() -> None:
             details={
                 "tasks_dir": args.tasks_dir,
                 "run_number": run_num,
-                "judge_model": judge_llm.model if judge_llm else None,
-                "judge_api_key": judge_llm.api_key if judge_llm else None,
-                "judge_region": (judge_llm.aws_region_name if judge_llm else None),
+                **council_details,
                 # Hint stored for the delivery exporter — original LLM
                 # identifiers (metadata.llm.model, details.judge_model) stay
                 # authoritative; the exporter uses these display names when
                 # building the delivery package.
                 "model_display_name": model_display_name,
-                "judge_model_display_name": (
-                    os.path.splitext(os.path.basename(args.judge_llm_config))[0]
-                    if args.judge_llm_config else None
-                ),
             },
             eval_limit=args.n_limit,
             n_critic_runs=getattr(args, "n_critic_runs", 1),

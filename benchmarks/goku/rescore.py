@@ -43,7 +43,11 @@ from benchmarks.goku.scorers.deterministic import (
     DETERMINISTIC_TYPES,
     score_deterministic,
 )
-from benchmarks.goku.scorers.llm_judge import LLM_JUDGE_TYPES, score_llm_judge
+from benchmarks.goku.scorers.llm_judge import (
+    LLM_JUDGE_TYPES,
+    score_llm_judge,
+    score_llm_judge_council,
+)
 from benchmarks.goku.scoring import compute_task_score, write_scores_jsonl
 from benchmarks.goku.task_loader import load_task
 from benchmarks.utils.llm_config import load_llm_config
@@ -230,6 +234,9 @@ def rescore_single(
     judge_api_key: str | None,
     judge_region: str | None,
     skip_llm_judge: bool,
+    judge_council_models: list[str] | None = None,
+    judge_council_api_keys: list[str | None] | None = None,
+    judge_council_regions: list[str | None] | None = None,
     input_image_paths: list[str] | None = None,
     output_media_paths: list[str] | None = None,
 ) -> tuple[list[ScorerResult], list[RubricItem]]:
@@ -248,6 +255,20 @@ def rescore_single(
                     judge_rationale="(skipped — --skip-llm-judge)",
                     points_awarded=0,
                 ))
+            elif judge_council_models:
+                # Council mode — multi-judge majority vote.
+                results.append(score_llm_judge_council(
+                    item=item,
+                    response=response_text,
+                    file_contents=file_contents,
+                    trajectory=trajectory,
+                    judge_models=judge_council_models,
+                    judge_api_keys=judge_council_api_keys,
+                    aws_region_names=judge_council_regions,
+                    input_image_paths=input_image_paths or [],
+                    output_media_paths=output_media_paths or [],
+                    task_key=task_dir.name,
+                ))
             else:
                 results.append(score_llm_judge(
                     item=item,
@@ -259,6 +280,10 @@ def rescore_single(
                     aws_region_name=judge_region,
                     input_image_paths=input_image_paths or [],
                     output_media_paths=output_media_paths or [],
+                    # task_dir.name is the task_xxx hash (e.g. task_abc...).
+                    # Used by the judge's many-image S3-URL short-circuit
+                    # so all rubric calls reuse one upload via cache.
+                    task_key=task_dir.name,
                 ))
         else:
             raise ValueError(
@@ -358,6 +383,17 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--judge-llm-configs", default=None,
+        help=(
+            "Comma-separated paths to LLM config JSONs for a judge COUNCIL "
+            "(e.g., .llm_config/claude-sonnet-4.6.json,.llm_config/gpt-5.json,"
+            ".llm_config/gemini-3.5-flash.json). When ≥2 configs are given, "
+            "each LLM-judged rubric is re-scored by all judges in parallel "
+            "and the verdict is majority-vote. Mutually exclusive with "
+            "--judge-llm-config."
+        ),
+    )
+    parser.add_argument(
         "--backup", action="store_true",
         help=(
             "Before overwriting scores.jsonl, copy it to "
@@ -396,19 +432,49 @@ def main() -> None:
     )
 
     # ---- 2. Resolve judge config ----
+    if args.judge_llm_config and args.judge_llm_configs:
+        parser.error(
+            "Specify either --judge-llm-config (single) OR "
+            "--judge-llm-configs (council), not both."
+        )
+
     judge_model: str
     judge_api_key: str | None
     judge_region: str | None
-    if args.judge_llm_config:
+    judge_council_models: list[str] | None = None
+    judge_council_api_keys: list[str | None] | None = None
+    judge_council_regions: list[str | None] | None = None
+
+    def _resolve_key(llm) -> str | None:
+        k = getattr(llm, "api_key", None)
+        if k is None:
+            return None
+        if hasattr(k, "get_secret_value"):
+            return k.get_secret_value()
+        return str(k)
+
+    if args.judge_llm_configs:
+        # Council mode
+        paths = [p.strip() for p in args.judge_llm_configs.split(",") if p.strip()]
+        if len(paths) < 2:
+            parser.error(
+                f"--judge-llm-configs requires ≥2 paths; got {len(paths)}. "
+                f"Use --judge-llm-config for single-judge scoring."
+            )
+        council_llms = [load_llm_config(p) for p in paths]
+        judge_council_models = [j.model for j in council_llms]
+        judge_council_api_keys = [_resolve_key(j) for j in council_llms]
+        judge_council_regions = [
+            getattr(j, "aws_region_name", None) for j in council_llms
+        ]
+        # Sentinel values for the single-judge path (not used in council mode)
+        judge_model = "<council>"
+        judge_api_key = None
+        judge_region = None
+    elif args.judge_llm_config:
         judge_llm = load_llm_config(args.judge_llm_config)
         judge_model = judge_llm.model
-        raw_key = judge_llm.api_key
-        if raw_key is None:
-            judge_api_key = None
-        elif hasattr(raw_key, "get_secret_value"):
-            judge_api_key = raw_key.get_secret_value()  # type: ignore[union-attr]
-        else:
-            judge_api_key = str(raw_key)
+        judge_api_key = _resolve_key(judge_llm)
         judge_region = getattr(judge_llm, "aws_region_name", None)
     else:
         judge_model = os.getenv(
@@ -537,6 +603,9 @@ def main() -> None:
                 judge_api_key=judge_api_key,
                 judge_region=judge_region,
                 skip_llm_judge=args.skip_llm_judge,
+                judge_council_models=judge_council_models,
+                judge_council_api_keys=judge_council_api_keys,
+                judge_council_regions=judge_council_regions,
                 # task.input_files is populated by load_task() from
                 # dataset/<task>/data/input_files/ — absolute paths to
                 # the task's input media that the judge needs for visual

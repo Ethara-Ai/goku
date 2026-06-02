@@ -119,8 +119,18 @@ def write_scores_jsonl(
     """
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
+    # Track whether any rubric was council-judged. If so, we'll also write a
+    # sidecar audit file alongside scores.jsonl to preserve per-judge data,
+    # but the primary scores.jsonl stays in CANONICAL CLIENT FORMAT —
+    # {number, passed, judge_rationale} only, no council metadata. The
+    # client-facing spec (DIU Goku doc §3.1) defines this schema; council
+    # metadata in scores.jsonl would surprise downstream consumers.
+    any_council = any(
+        item.per_judge_verdicts is not None for item in score.items
+    )
+
     with open(output_path, "w", encoding="utf-8") as f:
-        # Per-item rows
+        # Per-item rows — canonical schema only.
         for i, item_result in enumerate(score.items):
             # For negative items, invert 'passed' in output to match spec semantics:
             # spec: passed=false when hallucination detected (task failed on this item)
@@ -129,10 +139,24 @@ def write_scores_jsonl(
             if rubric_items and i < len(rubric_items) and rubric_items[i].points < 0:
                 display_passed = not item_result.passed
 
-            row = {
+            # For council-judged rubrics, pick a representative MAJORITY
+            # judge's rationale instead of the bracketed council summary
+            # (which mentions all 3 judges by name — not canonical client
+            # format). Falls back to item_result.judge_rationale for
+            # single-judge / deterministic / all-failed-judge cases.
+            chosen_rationale = item_result.judge_rationale
+            if item_result.per_judge_verdicts:
+                majority_rationales = [
+                    v.judge_rationale for v in item_result.per_judge_verdicts
+                    if v.passed == item_result.passed and v.error is None
+                ]
+                if majority_rationales:
+                    chosen_rationale = majority_rationales[0]
+
+            row: dict = {
                 "number": item_result.number,
                 "passed": display_passed,
-                "judge_rationale": item_result.judge_rationale,
+                "judge_rationale": chosen_rationale,
             }
             f.write(json.dumps(row) + "\n")
 
@@ -155,3 +179,45 @@ def write_scores_jsonl(
         )
 
     logger.info("Wrote scores to %s", output_path)
+
+    # Sidecar audit file: scores.council_audit.jsonl alongside scores.jsonl,
+    # written ONLY when at least one rubric was scored by the judge council.
+    # Holds per-judge verdicts + vote/consensus/disagreement metadata that
+    # used to live in scores.jsonl. Kept locally for our debugging /
+    # rubric-refinement workflow; NOT shipped in delivery (the delivery
+    # exporter doesn't pick up `scores.council_audit.jsonl`). If audit file
+    # ends up in delivery, it's because someone copied it manually.
+    if any_council:
+        audit_path = output_path.with_name("scores.council_audit.jsonl")
+        with open(audit_path, "w", encoding="utf-8") as af:
+            for i, item_result in enumerate(score.items):
+                if item_result.per_judge_verdicts is None:
+                    continue
+                display_passed = item_result.passed
+                if (rubric_items and i < len(rubric_items)
+                        and rubric_items[i].points < 0):
+                    display_passed = not item_result.passed
+                row = {
+                    "number": item_result.number,
+                    "passed": display_passed,
+                    "vote": item_result.vote,
+                    "consensus": item_result.consensus,
+                    "disagreement": item_result.disagreement,
+                    "per_judge_verdicts": [
+                        {
+                            "judge_model": v.judge_model,
+                            "passed": (
+                                (not v.passed)
+                                if (rubric_items and i < len(rubric_items)
+                                    and rubric_items[i].points < 0)
+                                else v.passed
+                            ),
+                            "judge_rationale": v.judge_rationale,
+                            "judge_cost_usd": round(v.judge_cost_usd, 6),
+                            **({"error": v.error} if v.error else {}),
+                        }
+                        for v in item_result.per_judge_verdicts
+                    ],
+                }
+                af.write(json.dumps(row) + "\n")
+        logger.info("Wrote council audit sidecar to %s", audit_path)

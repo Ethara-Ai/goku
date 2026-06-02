@@ -24,6 +24,20 @@ set -euo pipefail
 # Repo root derived from this script's own location — works regardless of
 # where the repo is cloned (override with REPO_DIR=... env var if needed).
 REPO_DIR="${REPO_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
+
+# Load local env (AWS creds, etc.) from gitignored .env if present. `set -a`
+# auto-exports everything sourced; child processes (run_infer.py, boto3) then
+# see AWS_BUCKET / AWS_REGION / AWS_FOLDER / AWS_ACCESS_SECRET_KEY / AWS_SECRET_KEY
+# without re-exporting per shell. Required for the V3 large-scale image path
+# (image_hosting.py); a missing .env on a >20-image task fails fast with a
+# clear RuntimeError from run_infer.py.
+if [[ -f "${REPO_DIR}/.env" ]]; then
+    set -a
+    # shellcheck disable=SC1091
+    source "${REPO_DIR}/.env"
+    set +a
+fi
+
 DATASET_DIR="${DATASET_DIR:-${REPO_DIR}/dataset}"
 OUTPUT_BASE="${OUTPUT_BASE:-${REPO_DIR}/eval_outputs}"
 DELIVERY_DIR="${DELIVERY_DIR:-${REPO_DIR}/delivery}"
@@ -150,6 +164,15 @@ GPT_CONFIG="${GPT_CONFIG:-}"
 GEMINI_CONFIG="${GEMINI_CONFIG:-}"
 JUDGE_CONFIG="${JUDGE_CONFIG:-}"
 
+# Judge council (Phase 1, 2026-06-01). When --judge-council is passed, the
+# wrapper assembles 3 LLM configs (Sonnet 4.6 + GPT-5 + Gemini 3.5 Flash)
+# and passes them to run_infer via --judge-llm-configs (plural).
+# Per-rubric LLM-judged scoring then runs all 3 in parallel and uses
+# majority vote (2/3) for the verdict. Single-judge mode (JUDGE_CONFIG)
+# remains the default — unchanged behavior unless --judge-council is set.
+JUDGE_COUNCIL=false
+JUDGE_COUNCIL_CONFIGS="${JUDGE_COUNCIL_CONFIGS:-${LLM_CONFIG_DIR}/claude-sonnet-4.6.json,${LLM_CONFIG_DIR}/gpt-5.json,${LLM_CONFIG_DIR}/gemini-3.5-flash.json}"
+
 # Execution parameters
 RUNS_PER_MODEL=3
 MAX_ITERATIONS=100         # Bumped from 30 — heavy multimodal tasks (PIL
@@ -165,7 +188,7 @@ MAX_PARALLEL_TASKS=1       # How many tasks to run concurrently (1 = sequential)
                            # Default 1 (sequential tasks) keeps memory under
                            # Docker Desktop's typical 8 GB allocation. Bump
                            # only if Docker has enough RAM headroom.
-RUN_TIMEOUT=3600           # Timeout per single run in seconds (60 min).
+RUN_TIMEOUT=7200           # Timeout per single run in seconds (120 min). Bumped from 3600 (60 min) on 2026-06-01 to give large-scale image tasks (V3) more room for strategies that involve container-side library installs.
                            # Empirically calibrated against the Aditya
                            # Joshi 40-min video task on 2026-05-22:
                            #   - Opus 4.7: 16.9 min end-to-end (inference
@@ -222,6 +245,15 @@ while [[ $# -gt 0 ]]; do
             RUN_TIMEOUT="$2"
             shift 2
             ;;
+        --judge-council)
+            JUDGE_COUNCIL=true
+            shift
+            ;;
+        --judge-council-configs)
+            JUDGE_COUNCIL_CONFIGS="$2"
+            JUDGE_COUNCIL=true
+            shift 2
+            ;;
         --parallel)
             MAX_PARALLEL_MODELS="$2"
             shift 2
@@ -254,7 +286,12 @@ while [[ $# -gt 0 ]]; do
             echo "  --tasks LIST       Comma-separated task keys (default: all in dataset/)"
             echo "  --models LIST      Comma-separated: opus,gpt,gemini (default: all)"
             echo "  --runs N           Runs per model per task (default: 3)"
-            echo "  --timeout SEC      Timeout per single run (default: 3600 / 60 min)"
+            echo "  --timeout SEC      Timeout per single run (default: 7200 / 120 min)"
+            echo "  --judge-council    Use 3-judge council (Sonnet 4.6 + GPT-5 + Gemini Flash)"
+            echo "                     instead of the default single-judge mode."
+            echo "  --judge-council-configs PATHS"
+            echo "                     Comma-separated LLM config paths for the council."
+            echo "                     Default: \$LLM_CONFIG_DIR/{claude-sonnet-4.6,gpt-5,gemini-3.5-flash}.json"
             echo "  --parallel N       Models to run concurrently per task (default: 3)"
             echo "  --parallel-tasks N Tasks to run concurrently (default: 1)"
             echo "                     Total concurrent containers ≈ parallel × parallel-tasks."
@@ -618,8 +655,21 @@ run_model_on_task() {
             # Kill any leftover containers before this run
             kill_ghost_containers
 
+            # Choose single-judge or council mode for this invocation.
+            # Council mode uses --judge-llm-configs (plural, comma-sep);
+            # single uses --judge-llm-config (singular). Mutually exclusive
+            # on the run_infer side — pick exactly one.
+            local judge_arg_name judge_arg_value
+            if [[ "$JUDGE_COUNCIL" == "true" ]]; then
+                judge_arg_name="--judge-llm-configs"
+                judge_arg_value="$JUDGE_COUNCIL_CONFIGS"
+            else
+                judge_arg_name="--judge-llm-config"
+                judge_arg_value="$JUDGE_CONFIG"
+            fi
+
             if [[ "$DRY_RUN" == "true" ]]; then
-                log_info "[DRY-RUN] Would execute: uv run goku-infer ${model_config} --tasks-dir dataset --task ${task} --runs 1 --workspace docker --max-iterations ${MAX_ITERATIONS} --num-workers ${NUM_WORKERS} --output-dir ${model_output}/run_${run_num} --critic pass --judge-llm-config ${JUDGE_CONFIG}"
+                log_info "[DRY-RUN] Would execute: uv run goku-infer ${model_config} --tasks-dir dataset --task ${task} --runs 1 --workspace docker --max-iterations ${MAX_ITERATIONS} --num-workers ${NUM_WORKERS} --output-dir ${model_output}/run_${run_num} --critic pass ${judge_arg_name} ${judge_arg_value}"
                 success=true
                 continue
             fi
@@ -638,7 +688,7 @@ run_model_on_task() {
                 --num-workers "$NUM_WORKERS" \
                 --output-dir "${model_output}/run_${run_num}" \
                 --critic pass \
-                --judge-llm-config "$JUDGE_CONFIG" \
+                "$judge_arg_name" "$judge_arg_value" \
                 2>&1 | tee "$attempt_log" >> "$model_log"; then
 
                 local run_end
@@ -901,12 +951,40 @@ main() {
             exit 1
         fi
     done
-    if [[ -z "$JUDGE_CONFIG" || ! -f "$JUDGE_CONFIG" ]]; then
-        log_error "No judge LLM config discovered (classifier looks for 'kimi'/'moonshot' in model field or 'judge' in filename)"
-        log_error "  Looked in: ${LLM_CONFIG_DIR}/*.json"
-        log_error "  Discovered files: ${_avail:-(none)}"
-        log_error "  Override explicitly: export JUDGE_CONFIG=/path/your-judge.json"
-        exit 1
+    if [[ "$JUDGE_COUNCIL" == "true" ]]; then
+        # Council mode: validate each path in JUDGE_COUNCIL_CONFIGS exists.
+        log_info "Judge mode: COUNCIL"
+        local _missing=""
+        IFS=',' read -ra _council_paths <<< "$JUDGE_COUNCIL_CONFIGS"
+        if [[ ${#_council_paths[@]} -lt 2 ]]; then
+            log_error "--judge-council requires ≥2 configs in JUDGE_COUNCIL_CONFIGS (comma-separated); got ${#_council_paths[@]}"
+            log_error "  Current: ${JUDGE_COUNCIL_CONFIGS}"
+            exit 1
+        fi
+        for _p in "${_council_paths[@]}"; do
+            _p="${_p// /}"  # strip whitespace
+            if [[ ! -f "$_p" ]]; then
+                _missing+="\n    missing: $_p"
+            else
+                log_info "  council member: $(basename "$_p")"
+            fi
+        done
+        if [[ -n "$_missing" ]]; then
+            log_error "Judge council config(s) not found:${_missing}"
+            log_error "  Override explicitly: --judge-council-configs path1,path2,path3"
+            exit 1
+        fi
+    else
+        log_info "Judge mode: SINGLE"
+        if [[ -z "$JUDGE_CONFIG" || ! -f "$JUDGE_CONFIG" ]]; then
+            log_error "No judge LLM config discovered (classifier looks for 'kimi'/'moonshot' in model field or 'judge' in filename)"
+            log_error "  Looked in: ${LLM_CONFIG_DIR}/*.json"
+            log_error "  Discovered files: ${_avail:-(none)}"
+            log_error "  Override explicitly: export JUDGE_CONFIG=/path/your-judge.json"
+            log_error "  Or pass --judge-council to use a 3-judge council"
+            exit 1
+        fi
+        log_info "  judge: $(basename "$JUDGE_CONFIG")"
     fi
     
     # Verify Docker image exists

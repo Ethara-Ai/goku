@@ -25,7 +25,7 @@ from benchmarks.goku.media_adapters import (
     supports_native_video,
 )
 from benchmarks.goku.media_render import pdf_to_page_images, video_to_keyframes
-from benchmarks.goku.models import RubricItem, ScorerResult
+from benchmarks.goku.models import JudgeVerdict, RubricItem, ScorerResult
 
 
 logger = logging.getLogger(__name__)
@@ -266,6 +266,7 @@ def _build_media_blocks(
     judge_model: str = "",
     judge_canonical: str | None = None,
     judge_api_key: str | None = None,
+    task_key: str | None = None,
 ) -> tuple[list[dict], list[str]]:
     """Convert task input media paths into content blocks for the judge.
 
@@ -295,6 +296,45 @@ def _build_media_blocks(
 
     provider = detect_provider(judge_model, judge_canonical)
     pdf_native = supports_native_pdf(judge_model, judge_canonical)
+
+    # Many-image short-circuit: if the input set is dominated by images
+    # AND the count exceeds the inline threshold AND S3 hosting is
+    # configured AND we have a task_key to scope the upload, swap to
+    # S3-hosted URL blocks. Reuses agent's already-uploaded URLs via
+    # the in-process cache in image_hosting.upload_task_images.
+    # Falls through to the regular per-file loop on any failure (e.g.,
+    # AWS creds missing) — caller sees the same inline path.
+    if task_key:
+        image_paths = [Path(p) for p in paths
+                       if Path(p).is_file()
+                       and Path(p).suffix.lower() in _IMAGE_MIME_BY_SUFFIX]
+        try:
+            from benchmarks.goku.image_hosting import (
+                should_use_url_hosting, upload_task_images,
+                s3_hosting_configured,
+            )
+            if should_use_url_hosting(image_paths) and s3_hosting_configured():
+                hosted = upload_task_images(image_paths=image_paths,
+                                            task_key=task_key)
+                blocks.extend(
+                    {"type": "image_url", "image_url": {"url": u}}
+                    for u in hosted.urls
+                )
+                # Drain hosted images from paths so the regular loop only
+                # handles non-image inputs (PDFs, videos). Comparison by
+                # resolved path because paths may be strings or Paths.
+                hosted_resolved = {str(p.resolve()) for p in image_paths}
+                paths = [p for p in paths
+                         if str(Path(p).resolve()) not in hosted_resolved]
+                logger.info(
+                    "_build_media_blocks: hosted %d input images via S3 "
+                    "(task_key=%s)", len(hosted.urls), task_key,
+                )
+        except Exception as e:
+            logger.warning(
+                "URL-hosting short-circuit failed (%s); falling back to "
+                "inline base64 for all media", e,
+            )
 
     # Running byte total across blocks added so far. Used to bound the
     # cumulative payload (Gemini inline ~100 MB ceiling) on top of the
@@ -610,6 +650,7 @@ def _score_llm_judge_single(
     input_image_paths: list[str] | list[Path] | None = None,
     output_media_paths: list[str] | list[Path] | None = None,
     judge_canonical_name: str | None = None,
+    task_key: str | None = None,
 ) -> ScorerResult:
     """Single LLM judge call (no retry/vote). Use `score_llm_judge` instead;
     that wraps this with retry-on-suspicion + N-of-3 voting.
@@ -676,12 +717,15 @@ def _score_llm_judge_single(
         judge_model=judge_model,
         judge_canonical=judge_canonical_name,
         judge_api_key=_key_for_upload,
+        task_key=task_key,  # for S3 URL hosting on many-image tasks
     )
     output_blocks, output_warnings = _build_media_blocks(
         output_media_paths,
         judge_model=judge_model,
         judge_canonical=judge_canonical_name,
         judge_api_key=_key_for_upload,
+        # task_key intentionally NOT passed for output paths — agent
+        # outputs are typically few and small; inline base64 is fine.
     )
     has_any_media = bool(input_blocks or output_blocks)
     media_note = _MEDIA_NOTE_WITH if has_any_media else _MEDIA_NOTE_WITHOUT
@@ -781,13 +825,29 @@ def _score_llm_judge_single(
     raw_content = ""
     judge_cost_usd = 0.0
     try:
+        # Temperature handling — per-provider compatibility:
+        #   * gpt-5 / gpt-5-codex: REQUIRE temperature=1.0 (LiteLLM raises
+        #     UnsupportedParamsError on temperature=0.0; verified 2026-06-01
+        #     when using gpt-5 as a council judge).
+        #   * claude/opus models: omit temperature entirely (Anthropic
+        #     rejects it for some models; same pattern used in agent runs).
+        #   * Other models (gemini-flash, etc.): temperature=0.0 for
+        #     deterministic verdicts.
         completion_kwargs: dict = {
             "model": judge_model,
             "messages": [{"role": "user", "content": message_content}],
-            "temperature": 0.0,
             "max_tokens": 16384,
             "response_format": {"type": "json_object"},
         }
+        _model_lc = judge_model.lower()
+        if "gpt-5" in _model_lc and "gpt-5.5" not in _model_lc:
+            # gpt-5 / gpt-5-codex / etc. — only support temperature=1.0
+            completion_kwargs["temperature"] = 1.0
+        elif "opus" in _model_lc or "claude-opus" in _model_lc:
+            # Anthropic Opus 4.7 rejects temperature param; omit entirely.
+            pass
+        else:
+            completion_kwargs["temperature"] = 0.0
         if judge_base_url:
             completion_kwargs["base_url"] = judge_base_url
 
@@ -1038,6 +1098,7 @@ def score_llm_judge(
     output_media_paths: list[str] | list[Path] | None = None,
     judge_canonical_name: str | None = None,
     enable_voting: bool = True,
+    task_key: str | None = None,
 ) -> ScorerResult:
     """Score a rubric item with retry-on-suspicion + N-of-3 voting fallback.
 
@@ -1061,6 +1122,7 @@ def score_llm_judge(
         input_image_paths=input_image_paths,
         output_media_paths=output_media_paths,
         judge_canonical_name=judge_canonical_name,
+        task_key=task_key,
     )
     first = _score_llm_judge_single(**kwargs)
     if not enable_voting or _is_refused(first):
@@ -1107,4 +1169,185 @@ def score_llm_judge(
         judge_rationale=combined_rationale,
         points_awarded=item.points if majority else 0,
         judge_cost_usd=combined_cost,
+    )
+
+
+# ─────────────────────────────────────────────────────────────────
+# Multi-judge council (Phase 1 of council rollout, 2026-06-01)
+# ─────────────────────────────────────────────────────────────────
+#
+# Calls N judges in parallel for a single rubric item, aggregates via
+# majority vote on the `passed` boolean. Reuses _score_llm_judge_single
+# for each judge call so all single-judge behavior (URL hosting,
+# media-block construction, retry, refusal handling) is unchanged.
+#
+# Failure model: if a judge call raises, its slot is filled with a
+# JudgeVerdict where passed=False + error=<reason>. This way one judge
+# crashing still lets the council form a verdict with the remaining N-1
+# judges. Aggregation treats the failed slot as a `False` vote — the
+# conservative direction (better to fail-closed than fail-open).
+#
+# Returns a ScorerResult with per_judge_verdicts populated. Existing
+# single-judge call sites are unaffected (they use score_llm_judge).
+
+
+def score_llm_judge_council(
+    item: RubricItem,
+    response: str,
+    file_contents: str,
+    trajectory: str,
+    judge_models: list[str],
+    judge_api_keys: list[str | None] | None = None,
+    judge_base_urls: list[str | None] | None = None,
+    aws_region_names: list[str | None] | None = None,
+    judge_canonical_names: list[str | None] | None = None,
+    input_image_paths: list[str] | list[Path] | None = None,
+    output_media_paths: list[str] | list[Path] | None = None,
+    task_key: str | None = None,
+    enable_per_judge_voting: bool = False,
+) -> ScorerResult:
+    """Run N judges in parallel, aggregate via majority vote on `passed`.
+
+    All judges receive the same inputs (criterion, response, media). Their
+    individual rationales are preserved in `per_judge_verdicts`. The
+    council's combined verdict is computed by majority of `passed` votes.
+
+    Args:
+        judge_models: list of N model strings (e.g. ["anthropic/...", ...]).
+            Must be the same length as judge_api_keys (if provided).
+        judge_api_keys: parallel list of API keys (None for env-based auth).
+        judge_base_urls: parallel list of base URLs (None for default).
+        aws_region_names: parallel list of regions (only used for bedrock).
+        judge_canonical_names: parallel list of canonical names (Bedrock ARN
+            hints for provider routing in _build_media_blocks).
+        enable_per_judge_voting: if True, each judge internally does the
+            existing 3-vote retry-on-suspicion. Defaults to False (council
+            already provides robustness via inter-judge diversity; per-judge
+            voting would multiply cost N×3 instead of N×1).
+
+    Returns:
+        ScorerResult with `per_judge_verdicts`, `vote`, `disagreement`,
+        and `consensus` populated. `judge_cost_usd` is summed across all
+        judges. `judge_rationale` is a combined human-readable summary.
+    """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    n = len(judge_models)
+    if n < 2:
+        raise ValueError(
+            f"score_llm_judge_council requires ≥2 judges; got {n}. "
+            f"Use score_llm_judge() for single-judge scoring."
+        )
+
+    # Normalize parallel lists to length n; default to None where omitted.
+    def _pad(xs: list | None) -> list:
+        if xs is None:
+            return [None] * n
+        if len(xs) != n:
+            raise ValueError(
+                f"Judge parameter list length {len(xs)} != judge_models length {n}"
+            )
+        return xs
+
+    api_keys = _pad(judge_api_keys)
+    base_urls = _pad(judge_base_urls)
+    regions = _pad(aws_region_names)
+    canonical_names = _pad(judge_canonical_names)
+
+    def _call_one_judge(idx: int) -> JudgeVerdict:
+        """Call a single judge; on exception return an `error` verdict."""
+        model = judge_models[idx]
+        try:
+            if enable_per_judge_voting:
+                # Each judge does its own retry-on-suspicion voting.
+                result = score_llm_judge(
+                    item=item, response=response, file_contents=file_contents,
+                    trajectory=trajectory, judge_model=model,
+                    judge_api_key=api_keys[idx],
+                    judge_base_url=base_urls[idx],
+                    aws_region_name=regions[idx],
+                    judge_canonical_name=canonical_names[idx],
+                    input_image_paths=input_image_paths,
+                    output_media_paths=output_media_paths,
+                    task_key=task_key,
+                    enable_voting=True,
+                )
+            else:
+                result = _score_llm_judge_single(
+                    item=item, response=response, file_contents=file_contents,
+                    trajectory=trajectory, judge_model=model,
+                    judge_api_key=api_keys[idx],
+                    judge_base_url=base_urls[idx],
+                    aws_region_name=regions[idx],
+                    judge_canonical_name=canonical_names[idx],
+                    input_image_paths=input_image_paths,
+                    output_media_paths=output_media_paths,
+                    task_key=task_key,
+                )
+            return JudgeVerdict(
+                judge_model=model,
+                passed=result.passed,
+                judge_rationale=result.judge_rationale,
+                judge_cost_usd=result.judge_cost_usd,
+                error=None,
+            )
+        except Exception as e:
+            logger.warning(
+                "Council judge %s failed on item #%d: %s",
+                model, item.number, e,
+            )
+            return JudgeVerdict(
+                judge_model=model,
+                passed=False,  # conservative — failed judge counted as a fail vote
+                judge_rationale=f"[Judge call failed: {type(e).__name__}: {e}]",
+                judge_cost_usd=0.0,
+                error=f"{type(e).__name__}: {e}",
+            )
+
+    # Run all N judges concurrently. Each judge call is I/O-bound (HTTP
+    # request to its provider), so threads are the natural concurrency
+    # primitive — the GIL is released around socket reads.
+    verdicts: list[JudgeVerdict] = [None] * n  # type: ignore[list-item]
+    with ThreadPoolExecutor(max_workers=n) as pool:
+        futures = {pool.submit(_call_one_judge, i): i for i in range(n)}
+        for fut in as_completed(futures):
+            idx = futures[fut]
+            verdicts[idx] = fut.result()
+
+    # Majority vote on `passed`.
+    n_pass = sum(1 for v in verdicts if v.passed)
+    n_total = len(verdicts)
+    council_passed = n_pass > n_total / 2  # strict majority
+    consensus_type = "unanimous" if (n_pass == n_total or n_pass == 0) else "majority"
+    disagreement = min(n_pass, n_total - n_pass)
+
+    # Combined rationale: lead with verdict + vote, then per-judge breakdown.
+    failed_judges = [v for v in verdicts if v.error is not None]
+    rationale_parts = [
+        f"[Council verdict: passed={council_passed} ({n_pass}/{n_total} pass)"
+        f"{' — unanimous' if consensus_type == 'unanimous' else ' — majority'}]",
+    ]
+    if failed_judges:
+        rationale_parts.append(
+            f"[{len(failed_judges)} judge(s) failed: "
+            + "; ".join(f"{v.judge_model}: {v.error}" for v in failed_judges)
+            + "]"
+        )
+    for v in verdicts:
+        rationale_parts.append(
+            f"\n[{v.judge_model} → passed={v.passed}]\n{v.judge_rationale}"
+        )
+    combined_rationale = "\n".join(rationale_parts)
+    combined_cost = sum(v.judge_cost_usd for v in verdicts)
+
+    return ScorerResult(
+        number=item.number,
+        passed=council_passed,
+        judge_rationale=combined_rationale,
+        points_awarded=item.points if council_passed else 0,
+        judge_cost_usd=combined_cost,
+        per_judge_verdicts=verdicts,
+        vote=f"{n_pass}/{n_total}",
+        disagreement=disagreement,
+        consensus=consensus_type,
     )
