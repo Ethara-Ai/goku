@@ -547,7 +547,21 @@ class GokuEvaluation(Evaluation):
             should_use_url_hosting, upload_task_images, s3_hosting_configured,
         )
         from pathlib import Path as _Path
-        use_url_mode = should_use_url_hosting([_Path(p) for p in agent_image_inputs])
+        # LiteLLM provider prefix from the configured model (e.g.
+        # "anthropic/claude-opus-4-7" → "anthropic"). Drives the
+        # provider-aware URL-vs-inline decision: providers whose APIs
+        # don't fetch remote URLs server-side (gemini, vertex, …) must
+        # use inline base64 to avoid LiteLLM doing 100 sequential S3
+        # GETs from inside the agent container.
+        _llm_model = getattr(getattr(self.metadata, "llm", None), "model", None)
+        _llm_provider = (
+            _llm_model.split("/", 1)[0].lower()
+            if _llm_model and "/" in _llm_model else None
+        )
+        use_url_mode = should_use_url_hosting(
+            [_Path(p) for p in agent_image_inputs],
+            llm_provider=_llm_provider,
+        )
         if use_url_mode:
             if not s3_hosting_configured():
                 raise RuntimeError(

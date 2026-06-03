@@ -272,3 +272,14 @@ secrets.*
 task*_*.pid
 *.watcher
 *.log.*.bak
+
+# Local orchestrator log-dir pointer files (used by ad-hoc rerun scripts)
+*log_dir
+*log_dir.tmp
+
+# Local-only documentation drafts / upstream bug reports
+docs/
+
+# Handoff folders / tarballs for colleagues (large output deliveries — never commit)
+goku_scoring_handoff_*/
+goku_scoring_handoff_*.tar.gz

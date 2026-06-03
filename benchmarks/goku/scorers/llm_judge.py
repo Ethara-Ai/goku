@@ -75,22 +75,30 @@ _VIDEO_SUFFIXES = {".mp4", ".mov", ".webm", ".avi", ".mkv"}
 # Verified via audit: opus × task_e25b6d and gpt × task_c6f458 had multiple
 # rubrics force-failed for this reason. 16 MB covers all observed agent outputs
 # while staying safely under Gemini's 20 MB-per-image hard limit.
-# Block-count cap. Bumped from 20 → 100 because a single 60-min video
-# expands into ~60 keyframes (1/min) and a 70-page PDF without native PDF
-# support expands to 70 page images. Anthropic / OpenAI / Gemini accept
-# up to ~100 attachments per request; 100 keeps us under the per-provider
-# ceiling while letting heavy multimodal tasks land in one judge call.
-_MAX_MEDIA_PER_CALL = 100
+# Block-count cap. Bumped from 20 → 100 → 350 — last bump observed when an
+# agent (gemini-3.1 on task_100images) preserved all 100 input images in its
+# output directory alongside ~100 newly-classified images, producing 300
+# total media blocks per judge call (100 inputs + 200 outputs). The 100-cap
+# defaulted every LLM-judged rubric to FAIL silently. 350 covers that worst
+# case with headroom while staying under Anthropic's per-request attachment
+# softness; the _MAX_TOTAL_MEDIA_BYTES cap below remains the real safety
+# rail against oversized inline payloads. A follow-up dedup (skip output
+# blocks whose content hash matches an input block) would be the proper
+# long-term fix and let us lower this back down.
+_MAX_MEDIA_PER_CALL = 350
 _MAX_IMAGE_BYTES = 16_000_000  # 16 MB (was 4 MB — too tight for multi-MP outputs)
 _MAX_PDF_BYTES = 30_000_000    # 30 MB (Anthropic limit is 32 MB)
 # Total media-payload cap across all blocks in ONE judge call. Without this
 # cap a 60-keyframe video (~1-3 MB/frame) plus a 30 MB PDF could push the
 # request past Gemini's ~100 MB inline-data ceiling and trigger silent
 # server-side truncation — the judge would then evaluate a partial payload
-# and return a wrong verdict that lands in scores.jsonl. 90 MB headroom:
-# fits 30 MB PDF + 60 keyframes at ~1 MB each, or 60-90 image blocks at
-# typical sizes, while staying under Gemini's hard limit.
-_MAX_TOTAL_MEDIA_BYTES = 90_000_000
+# and return a wrong verdict that lands in scores.jsonl. Bumped 90 MB →
+# 150 MB to keep proportional headroom with the new 350-block cap: 350
+# blocks at typical post-precondition sizes (~120 KB each) = ~42 MB,
+# leaving room for PDFs/keyframes too. Stays under Gemini's documented
+# 100 MB single-image inline ceiling and keeps the per-provider body
+# caps (Anthropic ~32 MB, OpenAI ~50 MB) as the downstream safety rail.
+_MAX_TOTAL_MEDIA_BYTES = 150_000_000
 # 120 frames = 2 fpm on a 60-min video (MAX_VIDEO_DURATION_SEC ceiling).
 # Was 8 — too sparse to verify any time-localized rubric. media_render
 # emits JPEG q=3 (~100-200 KB per frame), so 120 frames ≈ ~18 MB and fits

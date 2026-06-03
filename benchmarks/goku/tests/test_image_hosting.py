@@ -67,6 +67,29 @@ def test_should_use_url_hosting_empty(monkeypatch) -> None:
     assert image_hosting.should_use_url_hosting([]) is False
 
 
+def test_should_use_url_hosting_gemini_forces_inline(monkeypatch) -> None:
+    """Non-URL-fetching providers (gemini, vertex_ai, …) get inline mode
+    even past the count threshold — LiteLLM would otherwise have to
+    download each S3 URL from inside the container, which is fragile
+    on networks with intermittent S3 connectivity."""
+    monkeypatch.delenv("GOKU_IMAGE_MODE", raising=False)
+    paths = [Path(f"img_{i}.jpg") for i in range(100)]
+    # Whitelisted (server-side fetch) providers → URL mode at count > threshold
+    assert image_hosting.should_use_url_hosting(paths, llm_provider="anthropic") is True
+    assert image_hosting.should_use_url_hosting(paths, llm_provider="openai") is True
+    # Non-whitelisted providers → forced inline regardless of count
+    assert image_hosting.should_use_url_hosting(paths, llm_provider="gemini") is False
+    assert image_hosting.should_use_url_hosting(paths, llm_provider="vertex_ai") is False
+    assert image_hosting.should_use_url_hosting(paths, llm_provider="Gemini  ") is False  # case + whitespace
+    # No provider hint → falls back to count-only logic (backward compat)
+    assert image_hosting.should_use_url_hosting(paths) is True
+    # Env override beats provider gating in both directions
+    monkeypatch.setenv("GOKU_IMAGE_MODE", "many")
+    assert image_hosting.should_use_url_hosting(paths, llm_provider="gemini") is True
+    monkeypatch.setenv("GOKU_IMAGE_MODE", "inline")
+    assert image_hosting.should_use_url_hosting(paths, llm_provider="anthropic") is False
+
+
 def test_s3_hosting_configured_missing(monkeypatch) -> None:
     monkeypatch.delenv("GOKU_S3_BUCKET", raising=False)
     monkeypatch.delenv("AWS_BUCKET", raising=False)
@@ -140,14 +163,36 @@ def s3_env(monkeypatch):
     image_hosting._cache_clear()
 
 
-def _mock_s3_client():
-    """Return a mock boto3 S3 client with predictable behavior."""
+def _mock_s3_client(*, head_existing_keys: set[str] | None = None):
+    """Return a mock boto3 S3 client with predictable behavior.
+
+    Args:
+        head_existing_keys: Keys that head_object should treat as already
+            present (returns success). Any other key raises a 404
+            ClientError. Default empty → all HEADs miss (fresh bucket).
+    """
+    from botocore.exceptions import ClientError
+
+    existing = set(head_existing_keys or ())
     client = MagicMock()
     client.upload_file = MagicMock()
+
     # Each call to generate_presigned_url returns a synthetic URL based on the key
     def _presign(method, Params, ExpiresIn=None, **kwargs):
         return f"https://test-bucket.s3.amazonaws.com/{Params['Key']}?X-Amz-Signature=fake"
     client.generate_presigned_url.side_effect = _presign
+
+    def _head_object(Bucket=None, Key=None, **kwargs):
+        if Key in existing:
+            return {"ResponseMetadata": {"HTTPStatusCode": 200}}
+        raise ClientError(
+            {
+                "Error": {"Code": "404", "Message": "Not Found"},
+                "ResponseMetadata": {"HTTPStatusCode": 404},
+            },
+            "HeadObject",
+        )
+    client.head_object.side_effect = _head_object
     return client
 
 
@@ -174,7 +219,13 @@ def test_upload_task_images_uploads_each_file(tmp_path: Path, s3_env) -> None:
 
 
 def test_upload_task_images_uses_per_task_prefix(tmp_path: Path, s3_env) -> None:
-    """S3 keys all share the same task-scoped prefix (default AWS_FOLDER='goku')."""
+    """S3 keys are content-addressed under the task-scoped prefix.
+
+    Keys live at ``{folder}/{task_key}/{sha256_16}{ext}`` with no
+    run-specific subfolder, so reruns of the same task with the same
+    images reuse the same S3 objects.
+    """
+    import re
     images = [
         _make_test_image(tmp_path / f"img_{i}.png", size_px=(100, 100))
         for i in range(2)
@@ -184,12 +235,15 @@ def test_upload_task_images_uses_per_task_prefix(tmp_path: Path, s3_env) -> None
         result = image_hosting.upload_task_images(
             image_paths=images,
             task_key="task_xyz9876543210abc",
-            run_id="run_2026-05-27T15-30-00Z",
+            run_id="run_2026-05-27T15-30-00Z",  # accepted but no longer in key
         )
-    assert all(
-        img.s3_key.startswith("goku/task_xyz9876543210abc/run_2026-05-27T15-30-00Z/")
-        for img in result.images
-    )
+    for img in result.images:
+        assert re.match(
+            r"^goku/task_xyz9876543210abc/[0-9a-f]{16}\.(jpg|jpeg|png|gif|webp)$",
+            img.s3_key,
+        ), f"Unexpected key format: {img.s3_key}"
+    # run_prefix dropped the timestamp segment
+    assert result.run_prefix == "goku/task_xyz9876543210abc"
 
 
 def test_upload_task_images_respects_aws_folder_env(
@@ -203,7 +257,50 @@ def test_upload_task_images_respects_aws_folder_env(
         result = image_hosting.upload_task_images(
             image_paths=[img], task_key="task_x", run_id="run_x",
         )
-    assert result.images[0].s3_key.startswith("custom-prefix/task_x/run_x/")
+    # custom-prefix replaces 'goku'; run_x is no longer embedded in the key
+    assert result.images[0].s3_key.startswith("custom-prefix/task_x/")
+    assert "run_x" not in result.images[0].s3_key
+
+
+def test_upload_task_images_skips_upload_when_object_exists(
+    tmp_path: Path, s3_env
+) -> None:
+    """Across reruns (separate processes), HEAD-check finds the existing
+    content-hashed object and skips re-upload. Same image bytes always
+    map to the same S3 key."""
+    images = [
+        _make_test_image(tmp_path / f"img_{i}.png", size_px=(80, 80))
+        for i in range(3)
+    ]
+    # First "run": fresh bucket, all 3 should upload.
+    mock_run1 = _mock_s3_client()
+    with patch.object(image_hosting, "_get_s3_client", return_value=mock_run1):
+        result_run1 = image_hosting.upload_task_images(
+            image_paths=images, task_key="task_rerun_abc12345",
+        )
+    assert mock_run1.upload_file.call_count == 3
+    assert mock_run1.head_object.call_count == 3
+    keys_run1 = {img.s3_key for img in result_run1.images}
+
+    # Second "run" (simulates a new Python process — clear the in-process
+    # cache so the only thing that can prevent re-upload is the S3 HEAD).
+    image_hosting._cache_clear()
+    image_hosting._s3_client = None
+
+    # Mock now has those 3 keys "already in S3"
+    mock_run2 = _mock_s3_client(head_existing_keys=keys_run1)
+    with patch.object(image_hosting, "_get_s3_client", return_value=mock_run2):
+        result_run2 = image_hosting.upload_task_images(
+            image_paths=images, task_key="task_rerun_abc12345",
+        )
+    # No new uploads — all HEAD-hit
+    assert mock_run2.upload_file.call_count == 0
+    assert mock_run2.head_object.call_count == 3
+    # Keys are byte-identical between runs (content-addressed)
+    assert {img.s3_key for img in result_run2.images} == keys_run1
+    # URLs are still generated (signatures are per-call); URLs may differ
+    # in signature but point at the same objects.
+    assert len(result_run2.urls) == 3
 
 
 def test_upload_task_images_caches_within_process(tmp_path: Path, s3_env) -> None:
