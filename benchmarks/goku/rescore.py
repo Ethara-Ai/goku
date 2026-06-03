@@ -268,6 +268,12 @@ def rescore_single(
                     input_image_paths=input_image_paths or [],
                     output_media_paths=output_media_paths or [],
                     task_key=task_dir.name,
+                    # Defense against confabulation/inconsistency at the
+                    # individual-judge level. Conditional retry — only
+                    # fires when the judge's response trips suspicion
+                    # checks (cited fake filename or rationale/boolean
+                    # mismatch). Clean responses pay zero extra cost.
+                    enable_per_judge_voting=True,
                 ))
             else:
                 results.append(score_llm_judge(

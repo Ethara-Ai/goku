@@ -761,6 +761,12 @@ class GokuEvaluation(Evaluation):
                         input_image_paths=instance.data.get("input_files") or [],
                         output_media_paths=output_media_paths,
                         task_key=instance.id,
+                        # Defense against confabulation/inconsistency at the
+                        # individual-judge level. Conditional retry — only
+                        # fires when the judge's response trips suspicion
+                        # checks (cited fake filename or rationale/boolean
+                        # mismatch). Clean responses pay zero extra cost.
+                        enable_per_judge_voting=True,
                     )
                     results.append(result)
                     continue
