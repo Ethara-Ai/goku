@@ -486,9 +486,21 @@ def main() -> None:
             "behavior). Mind your judge API's rate limits when scaling up."
         ),
     )
+    parser.add_argument(
+        "--export-only", action="store_true",
+        help=(
+            "Skip all scoring and only run the delivery-export step. Read-only "
+            "against existing scores.jsonl files — no judge calls, no API cost, "
+            "no destructive writes. Requires --export-delivery; --judge-llm-config "
+            "is unused. Use this to refresh the delivery dir after manual edits "
+            "to scores.jsonl or rubrics.jsonl."
+        ),
+    )
     args = parser.parse_args()
     if args.num_workers < 1:
         parser.error("--num-workers must be >= 1")
+    if args.export_only and not args.export_delivery:
+        parser.error("--export-only requires --export-delivery <path>")
 
     # ---- 1. Resolve filters ----
     task_filter = (
@@ -500,16 +512,10 @@ def main() -> None:
         if args.models else None
     )
 
-    # ---- 2. Resolve judge config ----
-    if args.judge_llm_config and args.judge_llm_configs:
-        parser.error(
-            "Specify either --judge-llm-config (single) OR "
-            "--judge-llm-configs (council), not both."
-        )
-
-    judge_model: str
-    judge_api_key: str | None
-    judge_region: str | None
+    # ---- 2. Resolve judge config (skipped in --export-only) ----
+    judge_model: str = ""
+    judge_api_key: str | None = None
+    judge_region: str | None = None
     judge_council_models: list[str] | None = None
     judge_council_api_keys: list[str | None] | None = None
     judge_council_regions: list[str | None] | None = None
@@ -522,35 +528,39 @@ def main() -> None:
             return k.get_secret_value()
         return str(k)
 
-    if args.judge_llm_configs:
-        # Council mode
-        paths = [p.strip() for p in args.judge_llm_configs.split(",") if p.strip()]
-        if len(paths) < 2:
+    if not args.export_only:
+        if args.judge_llm_config and args.judge_llm_configs:
             parser.error(
-                f"--judge-llm-configs requires ≥2 paths; got {len(paths)}. "
-                f"Use --judge-llm-config for single-judge scoring."
+                "Specify either --judge-llm-config (single) OR "
+                "--judge-llm-configs (council), not both."
             )
-        council_llms = [load_llm_config(p) for p in paths]
-        judge_council_models = [j.model for j in council_llms]
-        judge_council_api_keys = [_resolve_key(j) for j in council_llms]
-        judge_council_regions = [
-            getattr(j, "aws_region_name", None) for j in council_llms
-        ]
-        # Sentinel values for the single-judge path (not used in council mode)
-        judge_model = "<council>"
-        judge_api_key = None
-        judge_region = None
-    elif args.judge_llm_config:
-        judge_llm = load_llm_config(args.judge_llm_config)
-        judge_model = judge_llm.model
-        judge_api_key = _resolve_key(judge_llm)
-        judge_region = getattr(judge_llm, "aws_region_name", None)
-    else:
-        judge_model = os.getenv(
-            "GOKU_JUDGE_MODEL", "gemini/gemini-3.5-flash"
-        )
-        judge_api_key = os.getenv("AWS_BEARER_TOKEN_BEDROCK")
-        judge_region = os.getenv("AWS_REGION_NAME")
+        if args.judge_llm_configs:
+            # Council mode
+            paths = [p.strip() for p in args.judge_llm_configs.split(",") if p.strip()]
+            if len(paths) < 2:
+                parser.error(
+                    f"--judge-llm-configs requires ≥2 paths; got {len(paths)}. "
+                    f"Use --judge-llm-config for single-judge scoring."
+                )
+            council_llms = [load_llm_config(p) for p in paths]
+            judge_council_models = [j.model for j in council_llms]
+            judge_council_api_keys = [_resolve_key(j) for j in council_llms]
+            judge_council_regions = [
+                getattr(j, "aws_region_name", None) for j in council_llms
+            ]
+            # Sentinel values for the single-judge path (not used in council mode)
+            judge_model = "<council>"
+        elif args.judge_llm_config:
+            judge_llm = load_llm_config(args.judge_llm_config)
+            judge_model = judge_llm.model
+            judge_api_key = _resolve_key(judge_llm)
+            judge_region = getattr(judge_llm, "aws_region_name", None)
+        else:
+            judge_model = os.getenv(
+                "GOKU_JUDGE_MODEL", "gemini/gemini-3.5-flash"
+            )
+            judge_api_key = os.getenv("AWS_BEARER_TOKEN_BEDROCK")
+            judge_region = os.getenv("AWS_REGION_NAME")
 
     # ---- 3. Discover targets ----
     output_base = Path(args.output_dir)
@@ -573,193 +583,201 @@ def main() -> None:
         return
 
     # ---- 4. Re-score each target ----
-    # Pre-load all task rubrics sequentially so workers don't race on the
-    # shared cache. Task loading is cheap (small JSON + file listing).
-    task_cache: dict[str, object] = {}
-    unique_task_keys = {task_key for task_key, _ in targets}
-    for task_key in unique_task_keys:
-        task_path = tasks_dir / task_key
-        if not task_path.is_dir():
-            logger.warning("Task %s not found in %s — skipping", task_key, tasks_dir)
-            task_cache[task_key] = None
-            continue
-        try:
-            task_cache[task_key] = load_task(task_path)
-        except Exception as e:
-            logger.error("Failed to load task %s: %s", task_key, e)
-            task_cache[task_key] = None
-
-    # Per-output.jsonl lock so concurrent (task, model) workers that target
-    # the SAME model's output.jsonl don't race on the read-modify-write done
-    # by update_output_jsonl_test_result. Different models have different
-    # output.jsonl files and therefore different locks.
-    output_jsonl_locks: dict[Path, threading.Lock] = defaultdict(threading.Lock)
-    output_jsonl_locks_mu = threading.Lock()
-
-    def _lock_for(path: Path) -> threading.Lock:
-        # defaultdict's factory isn't thread-safe; guard insertion.
-        with output_jsonl_locks_mu:
-            return output_jsonl_locks[path]
-
-    def _process_target(task_key: str, scores_file: Path) -> str:
-        """Rescore one (task, model) pair. Returns 'ok' | 'skip' | 'fail'."""
-        task = task_cache.get(task_key)
-        if task is None:
-            return "skip"
-
-        # Find the model-level output.jsonl that contains this task's record.
-        # On miss, fall back to the cumulative ``output.jsonl.ever_seen``
-        # ledger that clean_resume_state.py maintains across --rerun cycles
-        # (2026-05-23 / P1 fix). Without that fallback, repeated --rerun
-        # cleanups make an entry permanently unrescore-able.
-        model_dir = scores_file.parent.parent
-        model_output_jsonl = model_dir / "output.jsonl"
-        ever_seen_jsonl = model_dir / "output.jsonl.ever_seen"
-
-        def _find_entry(jsonl_path: Path) -> dict | None:
-            if not jsonl_path.is_file():
-                return None
-            try:
-                with open(jsonl_path, encoding="utf-8") as f:
-                    for raw in f:
-                        raw = raw.strip()
-                        if not raw:
-                            continue
-                        try:
-                            obj = json.loads(raw)
-                        except json.JSONDecodeError:
-                            continue
-                        if obj.get("instance_id") == task_key:
-                            return obj
-            except OSError:
-                return None
-            return None
-
-        agent_data = _find_entry(model_output_jsonl)
-        if agent_data is None:
-            agent_data = _find_entry(ever_seen_jsonl)
-            if agent_data is not None:
-                logger.info(
-                    "Recovered %s entry from %s (live output.jsonl no longer "
-                    "has it — likely stripped by prior --rerun)",
-                    task_key, ever_seen_jsonl.name,
-                )
-
-        if agent_data is None:
-            both = model_output_jsonl.name
-            if ever_seen_jsonl.is_file():
-                both += f" or {ever_seen_jsonl.name}"
-            logger.warning(
-                "No entry for %s in %s — skipping",
-                task_key, both,
-            )
-            return "skip"
-
-        # Reconstruct judge context from saved data
-        history = agent_data.get("history") or []
-        response_text = extract_response_from_history(history)
-        trajectory = format_trajectory(history)
-        file_contents, output_media_paths = collect_file_contents(
-            scores_file.parent / "results"
-        )
-
-        # Optionally back up the original scores.jsonl
-        if args.backup:
-            backup = scores_file.with_name("scores.before-rescore.jsonl")
-            if not backup.exists():
-                shutil.copy2(scores_file, backup)
-
-        # Score
-        try:
-            results, rubric_items = rescore_single(
-                task_dir=scores_file.parent,
-                rubric_items=task.rubric_items,  # type: ignore[union-attr]
-                response_text=response_text,
-                file_contents=file_contents,
-                trajectory=trajectory,
-                judge_model=judge_model,
-                judge_api_key=judge_api_key,
-                judge_region=judge_region,
-                skip_llm_judge=args.skip_llm_judge,
-                judge_council_models=judge_council_models,
-                judge_council_api_keys=judge_council_api_keys,
-                judge_council_regions=judge_council_regions,
-                # task.input_files is populated by load_task() from
-                # dataset/<task>/data/input_files/ — absolute paths to
-                # the task's input media that the judge needs for visual
-                # grounding (otherwise it has only the agent's claims).
-                input_image_paths=task.input_files,  # type: ignore[union-attr]
-                # Agent-produced media (PDFs/images/videos saved into the
-                # agent's results/ directory). Without this the judge sees
-                # only "(binary, N bytes)" placeholders for them and has
-                # to bluff about their content.
-                output_media_paths=output_media_paths,
-            )
-        except Exception:
-            logger.exception("Scoring failed for %s in %s", task_key, scores_file)
-            return "fail"
-
-        task_score = compute_task_score(results, rubric_items)
-        write_scores_jsonl(task_score, scores_file, rubric_items=rubric_items)
-        # Propagate the rescored aggregates back into the model-level
-        # output.jsonl. Without this, the downstream benchmark report
-        # (eval_infer.load_scores_from_runs reads test_result from
-        # output.jsonl) silently shows stale pre-rescore numbers.
-        # Serialize concurrent updates of the SAME output.jsonl (different
-        # tasks of the same model would race on the read-modify-write).
-        with _lock_for(model_output_jsonl):
-            if not update_output_jsonl_test_result(
-                model_output_jsonl, task_key, task_score,
-            ):
-                logger.warning(
-                    "Updated %s but could not propagate to %s — benchmark "
-                    "report may show stale aggregates for this instance.",
-                    scores_file, model_output_jsonl,
-                )
-        logger.info(
-            "Rescored %s in %s: passed=%s, per_task_score=%.4f, awarded=%d/%d",
-            task_key, scores_file.parent.parent.name[:30],
-            task_score.passed, task_score.per_task_score,
-            task_score.awarded, task_score.max_total,
-        )
-        return "ok"
-
-    # Dispatch — sequential when num_workers=1 (original behavior),
-    # ThreadPoolExecutor otherwise. Threads (not processes) because every
-    # judge call is HTTP-bound; the GIL is released during the network wait.
-    n_ok = 0
-    n_skip = 0
-    n_fail = 0
-    if args.num_workers == 1:
-        for task_key, scores_file in targets:
-            outcome = _process_target(task_key, scores_file)
-            if outcome == "ok": n_ok += 1
-            elif outcome == "skip": n_skip += 1
-            else: n_fail += 1
+    # --export-only short-circuits the entire scoring block. Read-only
+    # against existing scores.jsonl files; no judge calls, no rescoring,
+    # no destructive writes. Use this to refresh the delivery dir after
+    # manual edits without paying for another judge pass.
+    n_ok = n_skip = n_fail = 0
+    if args.export_only:
+        logger.info("--export-only set; skipping all scoring.")
     else:
-        logger.info(
-            "Parallel rescore: dispatching %d (task, model) pairs across %d workers",
-            len(targets), args.num_workers,
-        )
-        with ThreadPoolExecutor(max_workers=args.num_workers) as pool:
-            futures = {
-                pool.submit(_process_target, task_key, scores_file): (task_key, scores_file)
-                for task_key, scores_file in targets
-            }
-            for fut in as_completed(futures):
-                task_key, scores_file = futures[fut]
+        # Pre-load all task rubrics sequentially so workers don't race on the
+        # shared cache. Task loading is cheap (small JSON + file listing).
+        task_cache: dict[str, object] = {}
+        unique_task_keys = {task_key for task_key, _ in targets}
+        for task_key in unique_task_keys:
+            task_path = tasks_dir / task_key
+            if not task_path.is_dir():
+                logger.warning("Task %s not found in %s — skipping", task_key, tasks_dir)
+                task_cache[task_key] = None
+                continue
+            try:
+                task_cache[task_key] = load_task(task_path)
+            except Exception as e:
+                logger.error("Failed to load task %s: %s", task_key, e)
+                task_cache[task_key] = None
+
+        # Per-output.jsonl lock so concurrent (task, model) workers that target
+        # the SAME model's output.jsonl don't race on the read-modify-write done
+        # by update_output_jsonl_test_result. Different models have different
+        # output.jsonl files and therefore different locks.
+        output_jsonl_locks: dict[Path, threading.Lock] = defaultdict(threading.Lock)
+        output_jsonl_locks_mu = threading.Lock()
+
+        def _lock_for(path: Path) -> threading.Lock:
+            # defaultdict's factory isn't thread-safe; guard insertion.
+            with output_jsonl_locks_mu:
+                return output_jsonl_locks[path]
+
+        def _process_target(task_key: str, scores_file: Path) -> str:
+            """Rescore one (task, model) pair. Returns 'ok' | 'skip' | 'fail'."""
+            task = task_cache.get(task_key)
+            if task is None:
+                return "skip"
+
+            # Find the model-level output.jsonl that contains this task's record.
+            # On miss, fall back to the cumulative ``output.jsonl.ever_seen``
+            # ledger that clean_resume_state.py maintains across --rerun cycles
+            # (2026-05-23 / P1 fix). Without that fallback, repeated --rerun
+            # cleanups make an entry permanently unrescore-able.
+            model_dir = scores_file.parent.parent
+            model_output_jsonl = model_dir / "output.jsonl"
+            ever_seen_jsonl = model_dir / "output.jsonl.ever_seen"
+
+            def _find_entry(jsonl_path: Path) -> dict | None:
+                if not jsonl_path.is_file():
+                    return None
                 try:
-                    outcome = fut.result()
-                except Exception:
-                    logger.exception(
-                        "Worker raised for %s in %s", task_key, scores_file,
+                    with open(jsonl_path, encoding="utf-8") as f:
+                        for raw in f:
+                            raw = raw.strip()
+                            if not raw:
+                                continue
+                            try:
+                                obj = json.loads(raw)
+                            except json.JSONDecodeError:
+                                continue
+                            if obj.get("instance_id") == task_key:
+                                return obj
+                except OSError:
+                    return None
+                return None
+
+            agent_data = _find_entry(model_output_jsonl)
+            if agent_data is None:
+                agent_data = _find_entry(ever_seen_jsonl)
+                if agent_data is not None:
+                    logger.info(
+                        "Recovered %s entry from %s (live output.jsonl no longer "
+                        "has it — likely stripped by prior --rerun)",
+                        task_key, ever_seen_jsonl.name,
                     )
-                    outcome = "fail"
+
+            if agent_data is None:
+                both = model_output_jsonl.name
+                if ever_seen_jsonl.is_file():
+                    both += f" or {ever_seen_jsonl.name}"
+                logger.warning(
+                    "No entry for %s in %s — skipping",
+                    task_key, both,
+                )
+                return "skip"
+
+            # Reconstruct judge context from saved data
+            history = agent_data.get("history") or []
+            response_text = extract_response_from_history(history)
+            trajectory = format_trajectory(history)
+            file_contents, output_media_paths = collect_file_contents(
+                scores_file.parent / "results"
+            )
+
+            # Optionally back up the original scores.jsonl
+            if args.backup:
+                backup = scores_file.with_name("scores.before-rescore.jsonl")
+                if not backup.exists():
+                    shutil.copy2(scores_file, backup)
+
+            # Score
+            try:
+                results, rubric_items = rescore_single(
+                    task_dir=scores_file.parent,
+                    rubric_items=task.rubric_items,  # type: ignore[union-attr]
+                    response_text=response_text,
+                    file_contents=file_contents,
+                    trajectory=trajectory,
+                    judge_model=judge_model,
+                    judge_api_key=judge_api_key,
+                    judge_region=judge_region,
+                    skip_llm_judge=args.skip_llm_judge,
+                    judge_council_models=judge_council_models,
+                    judge_council_api_keys=judge_council_api_keys,
+                    judge_council_regions=judge_council_regions,
+                    # task.input_files is populated by load_task() from
+                    # dataset/<task>/data/input_files/ — absolute paths to
+                    # the task's input media that the judge needs for visual
+                    # grounding (otherwise it has only the agent's claims).
+                    input_image_paths=task.input_files,  # type: ignore[union-attr]
+                    # Agent-produced media (PDFs/images/videos saved into the
+                    # agent's results/ directory). Without this the judge sees
+                    # only "(binary, N bytes)" placeholders for them and has
+                    # to bluff about their content.
+                    output_media_paths=output_media_paths,
+                )
+            except Exception:
+                logger.exception("Scoring failed for %s in %s", task_key, scores_file)
+                return "fail"
+
+            task_score = compute_task_score(results, rubric_items)
+            write_scores_jsonl(task_score, scores_file, rubric_items=rubric_items)
+            # Propagate the rescored aggregates back into the model-level
+            # output.jsonl. Without this, the downstream benchmark report
+            # (eval_infer.load_scores_from_runs reads test_result from
+            # output.jsonl) silently shows stale pre-rescore numbers.
+            # Serialize concurrent updates of the SAME output.jsonl (different
+            # tasks of the same model would race on the read-modify-write).
+            with _lock_for(model_output_jsonl):
+                if not update_output_jsonl_test_result(
+                    model_output_jsonl, task_key, task_score,
+                ):
+                    logger.warning(
+                        "Updated %s but could not propagate to %s — benchmark "
+                        "report may show stale aggregates for this instance.",
+                        scores_file, model_output_jsonl,
+                    )
+            logger.info(
+                "Rescored %s in %s: passed=%s, per_task_score=%.4f, awarded=%d/%d",
+                task_key, scores_file.parent.parent.name[:30],
+                task_score.passed, task_score.per_task_score,
+                task_score.awarded, task_score.max_total,
+            )
+            return "ok"
+
+        # Dispatch — sequential when num_workers=1 (original behavior),
+        # ThreadPoolExecutor otherwise. Threads (not processes) because every
+        # judge call is HTTP-bound; the GIL is released during the network wait.
+        n_ok = 0
+        n_skip = 0
+        n_fail = 0
+        if args.num_workers == 1:
+            for task_key, scores_file in targets:
+                outcome = _process_target(task_key, scores_file)
                 if outcome == "ok": n_ok += 1
                 elif outcome == "skip": n_skip += 1
                 else: n_fail += 1
+        else:
+            logger.info(
+                "Parallel rescore: dispatching %d (task, model) pairs across %d workers",
+                len(targets), args.num_workers,
+            )
+            with ThreadPoolExecutor(max_workers=args.num_workers) as pool:
+                futures = {
+                    pool.submit(_process_target, task_key, scores_file): (task_key, scores_file)
+                    for task_key, scores_file in targets
+                }
+                for fut in as_completed(futures):
+                    task_key, scores_file = futures[fut]
+                    try:
+                        outcome = fut.result()
+                    except Exception:
+                        logger.exception(
+                            "Worker raised for %s in %s", task_key, scores_file,
+                        )
+                        outcome = "fail"
+                    if outcome == "ok": n_ok += 1
+                    elif outcome == "skip": n_skip += 1
+                    else: n_fail += 1
 
-    logger.info("Rescore complete: %d ok, %d skipped, %d failed", n_ok, n_skip, n_fail)
+        logger.info("Rescore complete: %d ok, %d skipped, %d failed", n_ok, n_skip, n_fail)
 
     # ---- 5. Optionally re-export delivery ----
     if args.export_delivery:
