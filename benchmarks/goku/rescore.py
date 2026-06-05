@@ -34,6 +34,9 @@ import logging
 import os
 import shutil
 import sys
+import threading
+from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -243,12 +246,60 @@ def rescore_single(
     """Run all rubric items for one task and return per-item results."""
     results: list[ScorerResult] = []
     output_dir = task_dir / "results"
+
+    # When --skip-llm-judge is on, look up any pre-existing LLM-rubric
+    # verdicts so we can preserve them instead of stomping on real rationales
+    # with placeholder strings. Without this, re-invoking --skip-llm-judge
+    # on a directory that already holds genuine judge output (e.g. a delivery
+    # refresh) silently destroys the verdicts. See 2026-06-04 incident.
+    existing_llm_rows: dict[int, dict] = {}
+    if skip_llm_judge:
+        existing_scores = task_dir / "scores.jsonl"
+        if existing_scores.is_file():
+            try:
+                with open(existing_scores, encoding="utf-8") as _f:
+                    for _line in _f:
+                        if not _line.strip():
+                            continue
+                        try:
+                            _row = json.loads(_line)
+                        except json.JSONDecodeError:
+                            continue
+                        if isinstance(_row, dict) and "number" in _row:
+                            existing_llm_rows[_row["number"]] = _row
+            except OSError:
+                pass
+
     for item in rubric_items:
         if item.type in DETERMINISTIC_TYPES:
             results.append(score_deterministic(item, output_dir, response_text))
         elif item.type in LLM_JUDGE_TYPES:
             if skip_llm_judge:
-                # Preserve a placeholder so the rubric structure stays intact.
+                # If a real LLM verdict already exists for this rubric,
+                # preserve it. Detect the placeholder we write below so
+                # repeated --skip-llm-judge runs don't perpetually carry
+                # stale placeholders forward — those still get refreshed.
+                prev = existing_llm_rows.get(item.number)
+                prev_rationale = (prev or {}).get("judge_rationale", "") or ""
+                is_placeholder = (
+                    not prev_rationale.strip()
+                    or "(skipped — --skip-llm-judge)" in prev_rationale
+                    or "[Judge not configured" in prev_rationale
+                )
+                if prev is not None and not is_placeholder:
+                    # Preserve the existing verdict — convert dict → ScorerResult
+                    results.append(ScorerResult(
+                        number=item.number,
+                        passed=bool(prev.get("passed", False)),
+                        judge_rationale=prev_rationale,
+                        points_awarded=int(
+                            prev.get("points_awarded")
+                            if prev.get("points_awarded") is not None
+                            else (item.points if prev.get("passed") else 0)
+                        ),
+                    ))
+                    continue
+                # Otherwise stub out the rubric so structure is intact.
                 results.append(ScorerResult(
                     number=item.number,
                     passed=False,
@@ -425,7 +476,19 @@ def main() -> None:
         "--dry-run", action="store_true",
         help="List what would be rescored, then exit without modifying anything.",
     )
+    parser.add_argument(
+        "--num-workers", type=int, default=1,
+        help=(
+            "Number of (task, model) pairs to rescore concurrently. Each "
+            "worker processes one pair end-to-end (rubric items still run "
+            "sequentially within a pair, and the council judges still run "
+            "in parallel per LLM-rubric). Default: 1 (sequential, original "
+            "behavior). Mind your judge API's rate limits when scaling up."
+        ),
+    )
     args = parser.parse_args()
+    if args.num_workers < 1:
+        parser.error("--num-workers must be >= 1")
 
     # ---- 1. Resolve filters ----
     task_filter = (
@@ -510,29 +573,39 @@ def main() -> None:
         return
 
     # ---- 4. Re-score each target ----
+    # Pre-load all task rubrics sequentially so workers don't race on the
+    # shared cache. Task loading is cheap (small JSON + file listing).
     task_cache: dict[str, object] = {}
-    n_ok = 0
-    n_skip = 0
-    n_fail = 0
-    for task_key, scores_file in targets:
-        # Load task rubrics (cached per task_key)
-        if task_key not in task_cache:
-            task_path = tasks_dir / task_key
-            if not task_path.is_dir():
-                logger.warning(
-                    "Task %s not found in %s — skipping", task_key, tasks_dir
-                )
-                task_cache[task_key] = None
-            else:
-                try:
-                    task_cache[task_key] = load_task(task_path)
-                except Exception as e:
-                    logger.error("Failed to load task %s: %s", task_key, e)
-                    task_cache[task_key] = None
-        task = task_cache[task_key]
-        if task is None:
-            n_skip += 1
+    unique_task_keys = {task_key for task_key, _ in targets}
+    for task_key in unique_task_keys:
+        task_path = tasks_dir / task_key
+        if not task_path.is_dir():
+            logger.warning("Task %s not found in %s — skipping", task_key, tasks_dir)
+            task_cache[task_key] = None
             continue
+        try:
+            task_cache[task_key] = load_task(task_path)
+        except Exception as e:
+            logger.error("Failed to load task %s: %s", task_key, e)
+            task_cache[task_key] = None
+
+    # Per-output.jsonl lock so concurrent (task, model) workers that target
+    # the SAME model's output.jsonl don't race on the read-modify-write done
+    # by update_output_jsonl_test_result. Different models have different
+    # output.jsonl files and therefore different locks.
+    output_jsonl_locks: dict[Path, threading.Lock] = defaultdict(threading.Lock)
+    output_jsonl_locks_mu = threading.Lock()
+
+    def _lock_for(path: Path) -> threading.Lock:
+        # defaultdict's factory isn't thread-safe; guard insertion.
+        with output_jsonl_locks_mu:
+            return output_jsonl_locks[path]
+
+    def _process_target(task_key: str, scores_file: Path) -> str:
+        """Rescore one (task, model) pair. Returns 'ok' | 'skip' | 'fail'."""
+        task = task_cache.get(task_key)
+        if task is None:
+            return "skip"
 
         # Find the model-level output.jsonl that contains this task's record.
         # On miss, fall back to the cumulative ``output.jsonl.ever_seen``
@@ -580,8 +653,7 @@ def main() -> None:
                 "No entry for %s in %s — skipping",
                 task_key, both,
             )
-            n_skip += 1
-            continue
+            return "skip"
 
         # Reconstruct judge context from saved data
         history = agent_data.get("history") or []
@@ -625,8 +697,7 @@ def main() -> None:
             )
         except Exception:
             logger.exception("Scoring failed for %s in %s", task_key, scores_file)
-            n_fail += 1
-            continue
+            return "fail"
 
         task_score = compute_task_score(results, rubric_items)
         write_scores_jsonl(task_score, scores_file, rubric_items=rubric_items)
@@ -634,21 +705,59 @@ def main() -> None:
         # output.jsonl. Without this, the downstream benchmark report
         # (eval_infer.load_scores_from_runs reads test_result from
         # output.jsonl) silently shows stale pre-rescore numbers.
-        if not update_output_jsonl_test_result(
-            model_output_jsonl, task_key, task_score,
-        ):
-            logger.warning(
-                "Updated %s but could not propagate to %s — benchmark "
-                "report may show stale aggregates for this instance.",
-                scores_file, model_output_jsonl,
-            )
+        # Serialize concurrent updates of the SAME output.jsonl (different
+        # tasks of the same model would race on the read-modify-write).
+        with _lock_for(model_output_jsonl):
+            if not update_output_jsonl_test_result(
+                model_output_jsonl, task_key, task_score,
+            ):
+                logger.warning(
+                    "Updated %s but could not propagate to %s — benchmark "
+                    "report may show stale aggregates for this instance.",
+                    scores_file, model_output_jsonl,
+                )
         logger.info(
             "Rescored %s in %s: passed=%s, per_task_score=%.4f, awarded=%d/%d",
             task_key, scores_file.parent.parent.name[:30],
             task_score.passed, task_score.per_task_score,
             task_score.awarded, task_score.max_total,
         )
-        n_ok += 1
+        return "ok"
+
+    # Dispatch — sequential when num_workers=1 (original behavior),
+    # ThreadPoolExecutor otherwise. Threads (not processes) because every
+    # judge call is HTTP-bound; the GIL is released during the network wait.
+    n_ok = 0
+    n_skip = 0
+    n_fail = 0
+    if args.num_workers == 1:
+        for task_key, scores_file in targets:
+            outcome = _process_target(task_key, scores_file)
+            if outcome == "ok": n_ok += 1
+            elif outcome == "skip": n_skip += 1
+            else: n_fail += 1
+    else:
+        logger.info(
+            "Parallel rescore: dispatching %d (task, model) pairs across %d workers",
+            len(targets), args.num_workers,
+        )
+        with ThreadPoolExecutor(max_workers=args.num_workers) as pool:
+            futures = {
+                pool.submit(_process_target, task_key, scores_file): (task_key, scores_file)
+                for task_key, scores_file in targets
+            }
+            for fut in as_completed(futures):
+                task_key, scores_file = futures[fut]
+                try:
+                    outcome = fut.result()
+                except Exception:
+                    logger.exception(
+                        "Worker raised for %s in %s", task_key, scores_file,
+                    )
+                    outcome = "fail"
+                if outcome == "ok": n_ok += 1
+                elif outcome == "skip": n_skip += 1
+                else: n_fail += 1
 
     logger.info("Rescore complete: %d ok, %d skipped, %d failed", n_ok, n_skip, n_fail)
 
