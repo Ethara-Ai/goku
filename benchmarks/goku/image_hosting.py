@@ -57,6 +57,7 @@ Usage
     )
     # urls = ["https://bucket.s3.us-east-1.amazonaws.com/goku-tasks/.../img_001.jpg?X-Amz-Signature=...", ...]
 """
+
 from __future__ import annotations
 
 import hashlib
@@ -66,6 +67,7 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+
 
 logger = logging.getLogger(__name__)
 
@@ -77,17 +79,19 @@ logger = logging.getLogger(__name__)
 # which is fragile at scale (every fetch is exposed to container-side
 # network conditions). For those providers we always pick the inline
 # base64 path so no S3 fetches happen at the agent edge.
-PROVIDERS_THAT_FETCH_URLS_SERVER_SIDE: frozenset[str] = frozenset({
-    "anthropic",
-    "openai",
-})
+PROVIDERS_THAT_FETCH_URLS_SERVER_SIDE: frozenset[str] = frozenset(
+    {
+        "anthropic",
+        "openai",
+    }
+)
 
 
 # Defaults — overridable via env vars (see module docstring)
-_DEFAULT_KEY_PREFIX = "goku"             # matches AWS_FOLDER default in prod
-_DEFAULT_URL_TTL_SEC = 24 * 3600         # 24h
-_DEFAULT_MAX_DIM = 2000                  # Anthropic many-image cap
-_DEFAULT_JPEG_QUALITY = 75               # balance: fidelity vs size
+_DEFAULT_KEY_PREFIX = "goku"  # matches AWS_FOLDER default in prod
+_DEFAULT_URL_TTL_SEC = 24 * 3600  # 24h
+_DEFAULT_MAX_DIM = 2000  # Anthropic many-image cap
+_DEFAULT_JPEG_QUALITY = 75  # balance: fidelity vs size
 
 
 # Module-level boto3 client cache (one client per process is fine —
@@ -101,7 +105,9 @@ _s3_client: Any = None
 # process) share one upload across many rubric calls. Cache TTL matches
 # the presigned URL TTL so we regenerate the URL before it expires
 # without re-uploading.
-_HOSTED_URL_CACHE: dict[tuple, tuple[str, float]] = {}
+_HOSTED_URL_CACHE: dict[
+    tuple, tuple[str, float, str]
+] = {}  # ck -> (url, generated_at, s3_key)
 
 
 def _hosted_cache_key(task_key: str, path: Path) -> tuple:
@@ -142,13 +148,11 @@ def _get_s3_client() -> Any:
             "Set to the region where the S3 bucket lives (e.g., us-east-1)."
         )
     # Credential discovery — accept both standard and project-alias names.
-    access_key = (
-        os.environ.get("AWS_ACCESS_KEY_ID")
-        or os.environ.get("AWS_ACCESS_SECRET_KEY")
+    access_key = os.environ.get("AWS_ACCESS_KEY_ID") or os.environ.get(
+        "AWS_ACCESS_SECRET_KEY"
     )
-    secret_key = (
-        os.environ.get("AWS_SECRET_ACCESS_KEY")
-        or os.environ.get("AWS_SECRET_KEY")
+    secret_key = os.environ.get("AWS_SECRET_ACCESS_KEY") or os.environ.get(
+        "AWS_SECRET_KEY"
     )
     kwargs: dict[str, Any] = {
         "region_name": region,
@@ -194,8 +198,11 @@ def _url_ttl() -> int:
         try:
             return int(raw)
         except ValueError:
-            logger.warning("Invalid GOKU_S3_URL_TTL_SEC=%r; using default %ds",
-                           raw, _DEFAULT_URL_TTL_SEC)
+            logger.warning(
+                "Invalid GOKU_S3_URL_TTL_SEC=%r; using default %ds",
+                raw,
+                _DEFAULT_URL_TTL_SEC,
+            )
     return _DEFAULT_URL_TTL_SEC
 
 
@@ -203,9 +210,12 @@ def _url_ttl() -> int:
 # Image preconditioning (uniform across providers)
 # ─────────────────────────────────────────────────────────────────
 
+
 def _precondition_image(
-    src: Path, dest: Path,
-    *, max_dim: int = _DEFAULT_MAX_DIM,
+    src: Path,
+    dest: Path,
+    *,
+    max_dim: int = _DEFAULT_MAX_DIM,
     jpeg_quality: int = _DEFAULT_JPEG_QUALITY,
 ) -> Path:
     """Resize an image (if needed) to fit Anthropic's many-image dim cap
@@ -224,7 +234,7 @@ def _precondition_image(
         w, h = im.size
         if max(w, h) > max_dim:
             scale = max_dim / max(w, h)
-            im = im.resize((int(w * scale), int(h * scale)), Image.LANCZOS)
+            im = im.resize((int(w * scale), int(h * scale)), Image.Resampling.LANCZOS)
         if im.mode not in ("RGB", "L"):
             im = im.convert("RGB")
         im.save(dest, format="JPEG", quality=jpeg_quality, optimize=True)
@@ -235,20 +245,23 @@ def _precondition_image(
 # Upload + presigned URL generation
 # ─────────────────────────────────────────────────────────────────
 
+
 @dataclass
 class HostedImage:
     """One uploaded image's metadata."""
-    src_path: Path           # original local path
-    s3_key: str              # full S3 object key
-    presigned_url: str       # 24h GET URL
+
+    src_path: Path  # original local path
+    s3_key: str  # full S3 object key
+    presigned_url: str  # 24h GET URL
 
 
 @dataclass
 class TaskUploadResult:
     """All hosted images for one task. ``urls`` is the only field most
     callers need — pass directly to ``ImageContent(image_urls=...)``."""
+
     task_key: str
-    run_prefix: str          # e.g. "tasks/<hash>/run_<timestamp>"
+    run_prefix: str  # e.g. "tasks/<hash>/run_<timestamp>"
     images: list[HostedImage] = field(default_factory=list)
 
     @property
@@ -315,6 +328,7 @@ def upload_task_images(
 
     # Pre-condition into a scratch dir if requested
     import tempfile
+
     scratch_dir: Path | None = None
     if precondition:
         scratch_dir = Path(tempfile.mkdtemp(prefix=f"goku_imghost_{task_key}_"))
@@ -335,13 +349,19 @@ def upload_task_images(
         ck = _hosted_cache_key(task_key, src)
         cached = _HOSTED_URL_CACHE.get(ck)
         if cached is not None:
-            url, generated_at = cached
+            url, generated_at, cached_s3_key = cached
             # Regenerate URL if we're within 10% of TTL expiry — avoids
             # handing out a URL that'll die mid-conversation.
             if time.time() - generated_at < ttl * 0.9:
-                result.images.append(HostedImage(
-                    src_path=src, s3_key=ck[1], presigned_url=url,
-                ))
+                # Carry the REAL S3 key (not the local path) so downstream
+                # cleanup_task_uploads can actually delete the object.
+                result.images.append(
+                    HostedImage(
+                        src_path=src,
+                        s3_key=cached_s3_key,
+                        presigned_url=url,
+                    )
+                )
                 cache_hits += 1
                 continue
             # Expired — fall through to re-upload
@@ -369,14 +389,13 @@ def upload_task_images(
             object_exists = True
         except ClientError as head_err:
             code = head_err.response.get("Error", {}).get("Code", "")
-            status = head_err.response.get("ResponseMetadata", {}).get(
-                "HTTPStatusCode"
-            )
+            status = head_err.response.get("ResponseMetadata", {}).get("HTTPStatusCode")
             if code in ("404", "NoSuchKey", "NotFound") or status == 404:
                 object_exists = False
             else:
-                logger.error("S3 HEAD failed: s3://%s/%s : %s",
-                             bucket, s3_key, head_err)
+                logger.error(
+                    "S3 HEAD failed: s3://%s/%s : %s", bucket, s3_key, head_err
+                )
                 raise
 
         if object_exists:
@@ -390,8 +409,9 @@ def upload_task_images(
                     ExtraArgs={"ContentType": content_type},
                 )
             except Exception as e:
-                logger.error("S3 upload failed: %s → s3://%s/%s : %s",
-                             local, bucket, s3_key, e)
+                logger.error(
+                    "S3 upload failed: %s → s3://%s/%s : %s", local, bucket, s3_key, e
+                )
                 raise
             uploaded += 1
 
@@ -400,16 +420,33 @@ def upload_task_images(
             Params={"Bucket": bucket, "Key": s3_key},
             ExpiresIn=ttl,
         )
-        result.images.append(HostedImage(src_path=src, s3_key=s3_key,
-                                          presigned_url=url))
-        _HOSTED_URL_CACHE[ck] = (url, time.time())
+        result.images.append(
+            HostedImage(src_path=src, s3_key=s3_key, presigned_url=url)
+        )
+        _HOSTED_URL_CACHE[ck] = (url, time.time(), s3_key)
 
     elapsed = time.time() - t0
     logger.info(
         "image_hosting: %d uploaded, %d in-process cache, %d S3-reused, "
         "%.1fs (TTL=%ds, bucket=%s, prefix=%s, run_id=%s)",
-        uploaded, cache_hits, s3_reused, elapsed, ttl, bucket, run_prefix, run_id,
+        uploaded,
+        cache_hits,
+        s3_reused,
+        elapsed,
+        ttl,
+        bucket,
+        run_prefix,
+        run_id,
     )
+    # Remove the preconditioned scratch dir now that every image is on S3 (the
+    # returned presigned URLs reference S3, not these local files — nothing
+    # downstream reads them). Without this, each task leaks N preconditioned
+    # JPEGs into /tmp for the process lifetime, which fills the disk on a long
+    # parallel batch. ignore_errors so cleanup can never fail the upload.
+    if scratch_dir is not None:
+        import shutil
+
+        shutil.rmtree(scratch_dir, ignore_errors=True)
     return result
 
 
@@ -479,6 +516,7 @@ def should_use_url_hosting(
 # Cleanup (optional; relies on bucket lifecycle policy otherwise)
 # ─────────────────────────────────────────────────────────────────
 
+
 def cleanup_task_uploads(result: TaskUploadResult) -> int:
     """Delete all S3 objects created by ``upload_task_images``.
 
@@ -497,6 +535,5 @@ def cleanup_task_uploads(result: TaskUploadResult) -> int:
         batch = objects[i : i + 1000]
         resp = s3.delete_objects(Bucket=bucket, Delete={"Objects": batch})
         deleted += len(resp.get("Deleted", []))
-    logger.info("Cleanup: deleted %d S3 object(s) under %s",
-                deleted, result.run_prefix)
+    logger.info("Cleanup: deleted %d S3 object(s) under %s", deleted, result.run_prefix)
     return deleted

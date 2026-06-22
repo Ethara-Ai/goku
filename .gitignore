@@ -253,6 +253,11 @@ _archive_pre_rename_*/
 .llm_config.zip
 .llm_config*.zip
 *.zip
+# tarballs (build/transfer artifacts — e.g. agent-server.tar.gz)
+*.tar.gz
+
+# Serena MCP tool local state (cache, credentials, project config) — not project code
+.serena/
 
 # Local-only operational tooling (delivery cleanup for ad-hoc hand-edits)
 benchmarks/goku/scripts/clean_delivery.py

@@ -157,9 +157,7 @@ class TestResponseContains:
             type="response_contains",
             needles=["inventory", "calories"],
         )
-        result = score_deterministic(
-            item, tmp_path, "Here is the inventory."
-        )
+        result = score_deterministic(item, tmp_path, "Here is the inventory.")
         assert result.passed is False
         assert "calories" in result.judge_rationale
 
@@ -178,9 +176,7 @@ class TestResponseRegexPresent:
             type="response_regex_present",
             pattern=r"\d+ items",
         )
-        result = score_deterministic(
-            item, tmp_path, "Found 12 items in the pantry"
-        )
+        result = score_deterministic(item, tmp_path, "Found 12 items in the pantry")
         assert result.passed is True
 
     def test_regex_no_match(self, tmp_path: Path):
@@ -188,10 +184,42 @@ class TestResponseRegexPresent:
             type="response_regex_present",
             pattern=r"\d{4}-\d{2}-\d{2}",
         )
-        result = score_deterministic(
-            item, tmp_path, "No date present here"
-        )
+        result = score_deterministic(item, tmp_path, "No date present here")
         assert result.passed is False
+
+    def test_regex_large_match_does_not_false_timeout(self, tmp_path: Path):
+        """Regression: a greedy pattern matching a span larger than the
+        multiprocessing pipe buffer (~64 KB) must NOT be misreported as a
+        timeout. Before the worker capped its payload, the child blocked
+        flushing a multi-MB m.group() through the queue, the parent's
+        join(timeout) tripped, and a valid match was scored as a FAIL.
+        Uses a tight per-call timeout so a real regression fails fast.
+        """
+        import time
+
+        big = "a" * 2_000_000  # 2 MB single-line span
+        item = _make_item(type="response_regex_present", pattern=r"(?s)a.*a")
+        t0 = time.time()
+        result = score_deterministic(item, tmp_path, big)
+        elapsed = time.time() - t0
+
+        assert result.passed is True
+        # Returned promptly, NOT on the 30 s scorer timeout. Generous bound to
+        # stay stable on slow CI while still catching the deadlock regression.
+        assert elapsed < 20
+        # Preview is bounded — never the full multi-MB match.
+        assert len(result.judge_rationale) < 1_000
+
+    def test_regex_large_match_in_file(self, tmp_path: Path):
+        """Same large-match guard for the file-content scorer."""
+        (tmp_path / "blob.txt").write_text("x" * 2_000_000)
+        item = _make_item(
+            type="probe_file_contains",
+            paths=["blob.txt"],
+            pattern=r"x+",
+        )
+        result = score_deterministic(item, tmp_path, "")
+        assert result.passed is True
 
 
 class TestNegativePointsScoring:
@@ -201,9 +229,7 @@ class TestNegativePointsScoring:
             points=-5,
             needles=["fabricated"],
         )
-        result = score_deterministic(
-            item, tmp_path, "This is fabricated data"
-        )
+        result = score_deterministic(item, tmp_path, "This is fabricated data")
         assert result.passed is True
         assert result.points_awarded == -5
 
@@ -213,9 +239,7 @@ class TestNegativePointsScoring:
             points=-5,
             needles=["fabricated"],
         )
-        result = score_deterministic(
-            item, tmp_path, "This is accurate data"
-        )
+        result = score_deterministic(item, tmp_path, "This is accurate data")
         assert result.passed is False
         assert result.points_awarded == 0
 
@@ -232,11 +256,13 @@ class TestCleanShellStderr:
 
     def test_empty_stderr_returns_placeholder(self):
         from benchmarks.goku.scorers.deterministic import _clean_shell_stderr
+
         assert _clean_shell_stderr("") == "(empty)"
         assert _clean_shell_stderr("   \n  ") == "(empty)"
 
     def test_strips_sitecustomize_banner(self):
         from benchmarks.goku.scorers.deterministic import _clean_shell_stderr
+
         err = (
             "benchmarks sitecustomize imported\n"
             "+----------------------------------+\n"
@@ -249,6 +275,7 @@ class TestCleanShellStderr:
 
     def test_strips_modal_sandbox_noise(self):
         from benchmarks.goku.scorers.deterministic import _clean_shell_stderr
+
         err = (
             "benchmarks injected modal sitecustomize into run_instance_modal image\n"
             "[benchmarks] modal sitecustomize: applied sandbox timing patch\n"
@@ -261,12 +288,13 @@ class TestCleanShellStderr:
 
     def test_prefers_traceback_when_present(self):
         from benchmarks.goku.scorers.deterministic import _clean_shell_stderr
+
         err = (
             "benchmarks sitecustomize imported\n"
             "[benchmarks] modal sitecustomize: applied runtime debug patch\n"
             "Traceback (most recent call last):\n"
             '  File "<string>", line 1, in <module>\n'
-            "    assert \"food_items\" in d\n"
+            '    assert "food_items" in d\n'
             "AssertionError\n"
         )
         result = _clean_shell_stderr(err)
@@ -278,6 +306,7 @@ class TestCleanShellStderr:
 
     def test_budget_respected_on_huge_input(self):
         from benchmarks.goku.scorers.deterministic import _clean_shell_stderr
+
         err = "garbage line\n" * 1000 + "FINAL ERROR\n"
         result = _clean_shell_stderr(err, budget=50)
         assert len(result) <= 50
@@ -286,10 +315,11 @@ class TestCleanShellStderr:
 
     def test_traceback_budget_takes_tail(self):
         from benchmarks.goku.scorers.deterministic import _clean_shell_stderr
+
         # Very long traceback — we want the AssertionError at the end, not the start
         err = (
             "Traceback (most recent call last):\n"
-            + "  File \"long\", line 1, in <module>\n" * 50
+            + '  File "long", line 1, in <module>\n' * 50
             + "AssertionError: the real error\n"
         )
         result = _clean_shell_stderr(err, budget=80)

@@ -12,6 +12,7 @@ Implements 6 rubric types that can be evaluated without an LLM:
 from __future__ import annotations
 
 import logging
+import multiprocessing as mp
 import re
 import subprocess
 from collections.abc import Callable
@@ -113,10 +114,9 @@ def _score_probe_file_exists(
             continue
         matches = list(output_dir.rglob(p))
         file_matches = [
-            m for m in matches
-            if m.is_file()
-            and not m.is_symlink()
-            and _resolves_within(m, output_dir)
+            m
+            for m in matches
+            if m.is_file() and not m.is_symlink() and _resolves_within(m, output_dir)
         ]
         if file_matches:
             size = file_matches[0].stat().st_size
@@ -128,6 +128,111 @@ def _score_probe_file_exists(
     if missing:
         return False, f"Missing files: {missing}. Found: {found}"
     return True, f"All files exist: {found}"
+
+
+# Cap the matched-span preview the worker hands back through the queue.
+# The rationale only ever shows a short snippet, and — critically — a small
+# payload can never exceed the OS pipe buffer (~64 KB) that backs a
+# multiprocessing.Queue. A full m.group() on a greedy pattern over a large
+# file can be megabytes; that overflows the pipe, the child's feeder thread
+# blocks flushing it, the child never exits, and proc.join(timeout) below
+# then misreports a *valid* match as a timeout (scoring it as a FAIL). Keeping
+# the payload tiny removes that deadlock at the source while leaving the
+# matched/not-matched signal (payload is None ⇔ no match) unchanged.
+_MATCH_PREVIEW_CAP = 200
+
+# Preferred regex backend: the third-party ``regex`` module enforces a wall-
+# clock ``timeout`` INSIDE its C matcher, on the calling thread — no
+# subprocess, no fork. We fall back to the process-isolation path below only
+# when ``regex`` isn't importable.
+#
+# Why this matters for heavy/concurrent work: the fork-based fallback spawns a
+# child per call. In the live harness the scorer runs on a worker thread while
+# other threads (litellm, the judge council) are busy allocating and logging.
+# A child forked at that instant inherits whatever malloc/glibc and logging
+# locks those threads were holding — locked, with no owner thread in the child
+# — and can deadlock until the timeout fires, at which point a *valid* match is
+# killed and misscored as a FAIL. Measured: 150 forks under malloc+logging
+# contention → 21 hung past 7s, ~1200 ms/call average. The same workload via
+# ``regex`` → 0 hangs, ~0.01 ms/call. ``regex`` is also far more
+# backtracking-resistant, so genuine ReDoS rarely even reaches the timeout.
+try:
+    import regex as _regex  # noqa: N812  (third-party, drop-in superset of re)
+except ImportError:  # pragma: no cover - regex is a transitive dependency
+    _regex = None
+
+
+def _search_with_timeout(
+    pattern: str, text: str, flags: int = 0, timeout: float = 30.0
+) -> tuple[bool | None, str]:
+    """Search ``text`` for ``pattern`` with a hard wall-clock ``timeout``.
+
+    Returns ``(matched, info)`` where ``matched`` is ``True``/``False`` for a
+    decided check and ``None`` when the match could not be evaluated (timeout
+    or invalid pattern); callers treat ``None`` as a failed — not hung —
+    check. ``info`` is a short (≤``_MATCH_PREVIEW_CAP``) preview / reason
+    string used only for the human-readable rationale.
+
+    Primary path uses the ``regex`` module's in-thread C-level timeout
+    (thread-safe, no process churn). Falls back to a forked ``re.search`` only
+    when ``regex`` is unavailable. See the module note above for why forking
+    per call is avoided under concurrency.
+    """
+    if _regex is not None:
+        try:
+            m = _regex.search(pattern, text, flags, timeout=timeout)
+        except _regex.error as exc:
+            return None, f"invalid regex: {str(exc)[:_MATCH_PREVIEW_CAP]}"
+        except TimeoutError:
+            return None, f"regex timed out after {timeout:g}s"
+        if m is None:
+            return False, ""
+        return True, m.group()[:_MATCH_PREVIEW_CAP]
+    return _search_with_timeout_subprocess(pattern, text, flags, timeout)
+
+
+def _regex_search_worker(pattern: str, text: str, flags: int, q) -> None:
+    try:
+        m = re.search(pattern, text, flags)
+        # Truncate the preview, but preserve the None-means-no-match contract.
+        q.put(("ok", m.group()[:_MATCH_PREVIEW_CAP] if m else None))
+    except re.error as exc:
+        q.put(("error", str(exc)[:_MATCH_PREVIEW_CAP]))
+
+
+def _search_with_timeout_subprocess(
+    pattern: str, text: str, flags: int = 0, timeout: float = 30.0
+) -> tuple[bool | None, str]:
+    """Fallback: run ``re.search`` in a separate process so a pathological
+    (ReDoS) or malformed pattern can be hard-killed instead of hanging the
+    scorer. Used only when the ``regex`` module is not importable.
+
+    Python's ``re`` runs in C and ignores thread-based timeouts, so the match
+    must be executed in a child process that can be terminated. ``fork`` is
+    used (not ``spawn``) to avoid re-importing the heavy benchmarks/SDK stack
+    on every call; the OS still hard-kills a stuck C-level match on
+    ``terminate()`` via SIGTERM. The worker caps the payload it returns
+    (``_MATCH_PREVIEW_CAP``) so it can never exceed the queue pipe buffer.
+    """
+    try:
+        ctx = mp.get_context("fork")
+    except ValueError:  # platform without fork (e.g. Windows) — fall back
+        ctx = mp.get_context("spawn")
+    q = ctx.Queue()
+    proc = ctx.Process(target=_regex_search_worker, args=(pattern, text, flags, q))
+    proc.start()
+    proc.join(timeout)
+    if proc.is_alive():
+        proc.terminate()
+        proc.join()
+        return None, f"regex timed out after {timeout:g}s"
+    try:
+        status, payload = q.get_nowait()
+    except Exception:
+        return None, "regex evaluation produced no result"
+    if status == "error":
+        return None, f"invalid regex: {payload}"
+    return (payload is not None), payload
 
 
 def _score_probe_file_contains(
@@ -159,10 +264,9 @@ def _score_probe_file_contains(
     ):
         matches = list(output_dir.rglob(file_path))
         file_matches = [
-            m for m in matches
-            if m.is_file()
-            and not m.is_symlink()
-            and _resolves_within(m, output_dir)
+            m
+            for m in matches
+            if m.is_file() and not m.is_symlink() and _resolves_within(m, output_dir)
         ]
         if file_matches:
             full_path = file_matches[0]
@@ -175,9 +279,11 @@ def _score_probe_file_contains(
         return False, f"File {file_path} is not valid UTF-8 text"
 
     flags = re.IGNORECASE if item.ignore_case else 0
-    match = re.search(item.pattern, content, flags)
-    if match:
-        return True, f"Pattern '{item.pattern}' found in {file_path}: '{match.group()}'"
+    matched, info = _search_with_timeout(item.pattern, content, flags, timeout=30)
+    if matched is None:
+        return False, f"Pattern '{item.pattern}' on {file_path}: {info}"
+    if matched:
+        return True, f"Pattern '{item.pattern}' found in {file_path}: '{info}'"
     return False, f"Pattern '{item.pattern}' not found in {file_path}"
 
 
@@ -264,6 +370,17 @@ def _clean_shell_stderr(err: str, budget: int = 400) -> str:
     return joined[-budget:] if len(joined) > budget else joined
 
 
+# Upper bound on how many candidate subdirectories the FileNotFoundError
+# fallback will re-run the shell command in. Each retry runs the (possibly
+# 30 s) command once, so an uncapped fan-out over an organize/sort task that
+# copied an identically-named file into many subfolders would turn a single
+# rubric into an N × 30 s stall. 8 comfortably covers the real case (a file
+# saved one level deeper than the rubric expected) while bounding the worst
+# case. Candidates are tried shallowest-first so that real case is reached
+# before the cap.
+_MAX_SUBDIR_FALLBACK_RETRIES = 8
+
+
 def _score_shell_succeeds_real(
     item: RubricItem, output_dir: Path, _response: str
 ) -> tuple[bool, str]:
@@ -289,10 +406,11 @@ def _score_shell_succeeds_real(
     """
     if not item.raw_shell:
         return False, "No raw_shell command specified in rubric item"
+    raw_shell = item.raw_shell
 
     def _run(cwd: Path):
         return subprocess.run(
-            ["bash", "-c", item.raw_shell],
+            ["bash", "-c", raw_shell],
             shell=False,
             cwd=str(cwd),
             env={"PATH": "/usr/bin:/bin", "LANG": "C"},
@@ -318,15 +436,26 @@ def _score_shell_succeeds_real(
     stderr_full = result.stderr or ""
     m = re.search(r"FileNotFoundError.*?'([^/']+\.[A-Za-z0-9]+)'", stderr_full)
     fallback_attempt = None  # (subdir, retry_result) for diagnostic if all fail
+    truncated = False  # True if more rescue candidates existed than the cap
+    missing_name = ""  # set below when a FileNotFoundError name is detected
     if m:
         missing_name = m.group(1)
         try:
             candidates = sorted(output_dir.rglob(missing_name))
         except OSError:
             candidates = []
-        for hit in candidates:
-            if not hit.is_file() or hit.parent == output_dir:
-                continue
+        # Only real files in a *sub*directory are rescue candidates. Try the
+        # shallowest first (the intended case is a file saved one level
+        # deeper) and cap the number of command re-runs — see
+        # _MAX_SUBDIR_FALLBACK_RETRIES. Capping never introduces a new fail
+        # versus direct execution; it only bounds how many fail→pass rescues
+        # we attempt, and the most likely rescue ranks first.
+        eligible = [
+            hit for hit in candidates if hit.is_file() and hit.parent != output_dir
+        ]
+        eligible.sort(key=lambda h: (len(h.parts), str(h)))
+        truncated = len(eligible) > _MAX_SUBDIR_FALLBACK_RETRIES
+        for hit in eligible[:_MAX_SUBDIR_FALLBACK_RETRIES]:
             # Ensure the subdir is a descendant of output_dir (guard against
             # symlinks pointing outside the task dir).
             try:
@@ -349,6 +478,16 @@ def _score_shell_succeeds_real(
             if fallback_attempt is None:
                 fallback_attempt = (rel_parent, missing_name, retry)
 
+    # If we capped the candidate fan-out, say so — a rescue could be hiding
+    # in an untried subdir, so the operator knows the FAIL may be incomplete.
+    cap_note = (
+        f" (note: >{_MAX_SUBDIR_FALLBACK_RETRIES} candidate subdirs contained "
+        f"'{missing_name if m else ''}'; only the {_MAX_SUBDIR_FALLBACK_RETRIES} "
+        f"shallowest were retried — raise the cap if a deeper one is expected to pass)"
+        if truncated
+        else ""
+    )
+
     if fallback_attempt is not None:
         rel_parent, missing_name, retry = fallback_attempt
         retry_stderr = _clean_shell_stderr(retry.stderr or "", budget=400)
@@ -356,12 +495,13 @@ def _score_shell_succeeds_real(
             False,
             f"Shell command exited {retry.returncode}. File '{missing_name}' "
             f"WAS found in subdir '{rel_parent}/' (rubric expected it at cwd), "
-            f"but rubric still failed on its actual check. stderr: {retry_stderr}",
+            f"but rubric still failed on its actual check.{cap_note} "
+            f"stderr: {retry_stderr}",
         )
     stderr_preview = _clean_shell_stderr(result.stderr or "", budget=400)
     return (
         False,
-        f"Shell command exited {result.returncode}. stderr: {stderr_preview}",
+        f"Shell command exited {result.returncode}.{cap_note} stderr: {stderr_preview}",
     )
 
 
@@ -393,9 +533,11 @@ def _score_response_regex_present(
     if not item.pattern:
         return False, "No pattern specified in rubric item"
 
-    match = re.search(item.pattern, response)
-    if match:
-        return True, f"Regex '{item.pattern}' matched: '{match.group()}'"
+    matched, info = _search_with_timeout(item.pattern, response, 0, timeout=30)
+    if matched is None:
+        return False, f"Regex '{item.pattern}': {info}"
+    if matched:
+        return True, f"Regex '{item.pattern}' matched: '{info}'"
     return False, f"Regex '{item.pattern}' not found in response"
 
 

@@ -24,7 +24,6 @@ from dotenv import load_dotenv
 
 from benchmarks.goku.config import INFER_DEFAULTS
 from benchmarks.goku.judge_context import collect_file_contents
-from benchmarks.goku.media_adapters import detect_provider, supports_native_pdf
 from benchmarks.goku.media_render import video_to_keyframes
 from benchmarks.goku.models import RubricItem
 from benchmarks.goku.scorers.deterministic import (
@@ -74,8 +73,20 @@ load_dotenv()
 logger = get_logger(__name__)
 
 
+class ResponseExtractionError(RuntimeError):
+    """Raised when the agent's final response cannot be extracted because no
+    agent-sourced event ever materialized (a RemoteConversation race / lost-
+    events infrastructure failure) — as opposed to the agent legitimately
+    producing an empty answer. Propagated so the eval harness RETRIES the
+    instance instead of scoring a blank response as a wrong answer, which
+    would silently corrupt benchmark results on a transient infra blip.
+    """
+
+
 MAX_IMAGE_DIMENSION = 7680  # Bedrock limit is 8000px; leave margin
-AGENT_RESIZE_THRESHOLD = 3_500_000  # 3.5 MB on disk → ~4.7 MB base64 (under 5 MB API limit)
+AGENT_RESIZE_THRESHOLD = (
+    3_500_000  # 3.5 MB on disk → ~4.7 MB base64 (under 5 MB API limit)
+)
 
 # Magic-byte signatures → (mime_type, PIL format name)
 _IMAGE_SIGNATURES: list[tuple[bytes, str, str]] = [
@@ -148,7 +159,9 @@ def _resize_if_needed(image_path: str) -> str:
         scale = (AGENT_RESIZE_THRESHOLD / file_size) ** 0.5  # rough area estimate
         new_size = (int(img.size[0] * scale), int(img.size[1] * scale))
         img = img.resize(new_size, Image.Resampling.LANCZOS)
-        reasons.append(f"size {file_size / 1e6:.1f}→~{AGENT_RESIZE_THRESHOLD / 1e6:.1f}MB")
+        reasons.append(
+            f"size {file_size / 1e6:.1f}→~{AGENT_RESIZE_THRESHOLD / 1e6:.1f}MB"
+        )
 
     if needs_reencode:
         reasons.append(f"reencode {ext_mime}→{real_mime}")
@@ -303,6 +316,7 @@ class GokuEvaluation(Evaluation):
         # Create workspace directories and verify filesystem is writable.
         # The agent-server health check only confirms HTTP readiness, not
         # filesystem readiness.  Retry mkdir to give the container a moment.
+        result = None
         for attempt in range(3):
             result = workspace.execute_command("mkdir -p /workspace/results")
             exit_code = getattr(result, "exit_code", -1)
@@ -339,9 +353,7 @@ class GokuEvaluation(Evaluation):
         _has_video_input = any(
             Path(p).suffix.lower() in _video_exts for p in input_files
         )
-        _has_pdf_input = any(
-            Path(p).suffix.lower() == ".pdf" for p in input_files
-        )
+        _has_pdf_input = any(Path(p).suffix.lower() == ".pdf" for p in input_files)
         # PDF tool-mode install hook. Mirrors the ffmpeg install pattern:
         # one-time apt+pip per container, non-fatal on failure. Wires up the
         # in-container helpers used by ``pdf_pipeline.prepare_pdf_tool_mode``
@@ -351,6 +363,7 @@ class GokuEvaluation(Evaluation):
         # ``GOKU_PDF_MODE`` (default ``tool``; set to ``inline`` to skip).
         if _has_pdf_input and os.environ.get("GOKU_PDF_MODE", "tool") == "tool":
             from benchmarks.goku.pdf_pipeline import install_pdf_deps_in_container
+
             install_pdf_deps_in_container(workspace)
         if _has_video_input:
             logger.info(
@@ -368,7 +381,8 @@ class GokuEvaluation(Evaluation):
             _ff_exit = getattr(_ff_result, "exit_code", -1)
             if _ff_exit == 0:
                 logger.info(
-                    "ffmpeg installed in container in %.1fs", _ff_elapsed,
+                    "ffmpeg installed in container in %.1fs",
+                    _ff_elapsed,
                 )
             else:
                 # Non-fatal: agent still has the keyframes we extract
@@ -383,7 +397,9 @@ class GokuEvaluation(Evaluation):
                     "ffmpeg install failed (exit=%s, elapsed=%.1fs); agent "
                     "will only see the pre-extracted keyframes. Last "
                     "output: %s",
-                    _ff_exit, _ff_elapsed, _stderr[:300],
+                    _ff_exit,
+                    _ff_elapsed,
+                    _stderr[:300],
                 )
 
         for file_path in input_files:
@@ -420,13 +436,21 @@ class GokuEvaluation(Evaluation):
             container_id = getattr(workspace, "_container_id", None)
             if container_id:
                 import subprocess as _subprocess
+
                 logger.info(
                     f"Uploading {file_name} via docker cp ({os.path.getsize(actual_path):,} bytes) "
                     f"to container {container_id[:12]}"
                 )
                 cp_result = _subprocess.run(
-                    ["docker", "cp", actual_path, f"{container_id}:/workspace/{file_name}"],
-                    capture_output=True, text=True, timeout=600,
+                    [
+                        "docker",
+                        "cp",
+                        actual_path,
+                        f"{container_id}:/workspace/{file_name}",
+                    ],
+                    capture_output=True,
+                    text=True,
+                    timeout=600,
                 )
                 if cp_result.returncode == 0:
                     # Sanity check the size landed correctly.
@@ -435,9 +459,7 @@ class GokuEvaluation(Evaluation):
                         f"stat -c %s /workspace/{file_name} 2>/dev/null || echo 0",
                         timeout=10.0,
                     )
-                    actual_size = int(
-                        (getattr(chk, "stdout", "") or "0").strip() or 0
-                    )
+                    actual_size = int((getattr(chk, "stdout", "") or "0").strip() or 0)
                     if actual_size == expected_size:
                         upload_ok = True
                         logger.info(
@@ -494,9 +516,7 @@ class GokuEvaluation(Evaluation):
                     workspace.execute_command(cmd, timeout=60.0)
                     first = False
 
-                decode_cmd = (
-                    f"base64 -d {q_b64} > {q_dst} && rm {q_b64}"
-                )
+                decode_cmd = f"base64 -d {q_b64} > {q_dst} && rm {q_b64}"
                 decode_result = workspace.execute_command(decode_cmd, timeout=30.0)
                 if getattr(decode_result, "exit_code", -1) == 0:
                     upload_ok = True
@@ -539,14 +559,20 @@ class GokuEvaluation(Evaluation):
         # many-image path that fits Anthropic/Gemini body caps and survives
         # multi-turn agent conversations).
         agent_image_inputs: list[str] = [
-            p for p in input_files
+            p
+            for p in input_files
             if os.path.exists(p)
-            and p.rsplit(".", 1)[-1].lower() in ("jpg", "jpeg", "png", "gif", "webp", "bmp")
+            and p.rsplit(".", 1)[-1].lower()
+            in ("jpg", "jpeg", "png", "gif", "webp", "bmp")
         ]
-        from benchmarks.goku.image_hosting import (
-            should_use_url_hosting, upload_task_images, s3_hosting_configured,
-        )
         from pathlib import Path as _Path
+
+        from benchmarks.goku.image_hosting import (
+            s3_hosting_configured,
+            should_use_url_hosting,
+            upload_task_images,
+        )
+
         # LiteLLM provider prefix from the configured model (e.g.
         # "anthropic/claude-opus-4-7" → "anthropic"). Drives the
         # provider-aware URL-vs-inline decision: providers whose APIs
@@ -556,7 +582,8 @@ class GokuEvaluation(Evaluation):
         _llm_model = getattr(getattr(self.metadata, "llm", None), "model", None)
         _llm_provider = (
             _llm_model.split("/", 1)[0].lower()
-            if _llm_model and "/" in _llm_model else None
+            if _llm_model and "/" in _llm_model
+            else None
         )
         use_url_mode = should_use_url_hosting(
             [_Path(p) for p in agent_image_inputs],
@@ -578,7 +605,8 @@ class GokuEvaluation(Evaluation):
             image_urls.extend(hosted.urls)
             logger.info(
                 "Many-image mode: hosted %d images to S3 (run_prefix=%s)",
-                len(hosted.urls), hosted.run_prefix,
+                len(hosted.urls),
+                hosted.run_prefix,
             )
         for file_path in input_files:
             if not os.path.exists(file_path):
@@ -605,7 +633,8 @@ class GokuEvaluation(Evaluation):
                     logger.warning(
                         "Could not extract keyframes from %s: %s. Agent can "
                         "still tool-read the file from /workspace.",
-                        file_path, exc,
+                        file_path,
+                        exc,
                     )
                     continue
                 for frame in frames:
@@ -650,9 +679,12 @@ class GokuEvaluation(Evaluation):
             pdf_mode = os.environ.get("GOKU_PDF_MODE", "tool")
             if pdf_mode == "tool":
                 from benchmarks.goku.pdf_pipeline import prepare_pdf_tool_mode
+
                 try:
                     pdf_setup = prepare_pdf_tool_mode(
-                        pdf_paths, workspace=workspace, write_tools=True,
+                        pdf_paths,
+                        workspace=workspace,
+                        write_tools=True,
                     )
                 except Exception as exc:
                     logger.warning(
@@ -677,8 +709,7 @@ class GokuEvaluation(Evaluation):
                     # One ImageContent block with all thumbnails. Per-thumbnail
                     # ~10 KB at DPI 50; 55 pages × 10 KB = ~550 KB total.
                     thumb_urls = [
-                        _image_to_base64_url(str(p))
-                        for p in pdf_setup.thumbnail_paths
+                        _image_to_base64_url(str(p)) for p in pdf_setup.thumbnail_paths
                     ]
                     if thumb_urls:
                         content_blocks.append(ImageContent(image_urls=thumb_urls))
@@ -689,6 +720,7 @@ class GokuEvaluation(Evaluation):
                 # bundle in upstream agent_server ignores our schema patch;
                 # see main() docstring) — we do not attempt it here.
                 from benchmarks.goku.media_render import pdf_to_page_images
+
                 logger.info(
                     "PDF inline mode active for %s — rendering pages to images",
                     self.metadata.llm.model,
@@ -788,6 +820,7 @@ class GokuEvaluation(Evaluation):
                 )
                 if not judge_region and judge_model.startswith("bedrock/"):
                     import re as _re
+
                     m = _re.search(r"arn:aws:bedrock:([a-z0-9-]+):", judge_model)
                     if m:
                         judge_region = m.group(1)
@@ -854,6 +887,14 @@ class GokuEvaluation(Evaluation):
             shutil.rmtree(eval_results_dir)
         shutil.copytree(output_dir, eval_results_dir, dirs_exist_ok=True)
 
+        # The download temp dir has now been fully consumed — scoring is done
+        # (output_media_paths pointed into it) and its contents are persisted
+        # in eval_results_dir. Remove it so a long parallel batch doesn't leak
+        # one /tmp/goku_<id>_* dir (up to GOKU_MAX_DOWNLOAD_FILES files) per
+        # task and eventually fill the disk. ignore_errors so cleanup can never
+        # fail a successfully-scored instance.
+        shutil.rmtree(output_dir, ignore_errors=True)
+
         logger.info(
             f"Instance {instance.id}: per_task_score={task_score.per_task_score:.4f}, "
             f"passed={task_score.passed}, "
@@ -888,11 +929,13 @@ class GokuEvaluation(Evaluation):
         max_retries = 10
         retry_delay = 0.5
 
+        saw_agent_event = False
         for attempt in range(max_retries):
             for event in reversed(events):
                 # Check for agent-sourced events
                 if not hasattr(event, "source") or event.source != "agent":  # type: ignore[attr-defined]
                     continue
+                saw_agent_event = True
 
                 text: str | None = None
                 if isinstance(event, MessageEvent):
@@ -911,7 +954,21 @@ class GokuEvaluation(Evaluation):
             if attempt < max_retries - 1:
                 time.sleep(retry_delay)
 
-        logger.warning("Could not extract agent response from events")
+        # No agent text found after all retries. Distinguish two cases:
+        #   * No agent-sourced event materialized AT ALL → infrastructure
+        #     failure (RemoteConversation race / lost events). Raise so the
+        #     harness retries rather than scoring a blank as a wrong answer.
+        #   * Agent events exist but none carried final text → the agent
+        #     genuinely produced no answer (e.g. exhausted iterations). That
+        #     is a real (low-scoring) outcome, so return "" and let it score.
+        if not saw_agent_event:
+            raise ResponseExtractionError(
+                "No agent-sourced event found after "
+                f"{max_retries} retries (likely a RemoteConversation race)"
+            )
+        logger.warning(
+            "Agent produced no final text response (events present but empty)"
+        )
         return ""
 
     def _download_outputs(
@@ -970,16 +1027,39 @@ class GokuEvaluation(Evaluation):
                 getattr(result, "output", "") or getattr(result, "stdout", "") or ""
             )
             exit_code = getattr(result, "exit_code", -1)
-            if exit_code == 0 and stdout.strip():
-                remote_paths_raw = [
-                    ln.strip() for ln in stdout.strip().split("\n") if ln.strip()
-                ]
+            remote_paths_raw = [
+                ln.strip() for ln in stdout.strip().split("\n") if ln.strip()
+            ]
+            # `find ... | head` legitimately exits non-zero via SIGPIPE (141)
+            # when `head` closes the pipe after the cap — that is NOT a failure
+            # as long as we received file paths, so process them rather than
+            # dropping every output (the old `exit_code == 0` gate did exactly
+            # that). A non-zero exit WITH no paths, though, means the listing
+            # command actually failed: raise so the handler below cleans up and
+            # re-raises (harness retries) instead of silently scoring the task
+            # against zero output.
+            if exit_code != 0 and not remote_paths_raw:
+                raise RuntimeError(
+                    f"workspace file listing for {instance_id} failed "
+                    f"(exit={exit_code}, no output)"
+                )
+            if exit_code != 0:
+                logger.warning(
+                    "workspace listing for %s exited %s (likely SIGPIPE from "
+                    "the head cap); processing %d path(s) received.",
+                    instance_id,
+                    exit_code,
+                    len(remote_paths_raw),
+                )
+            if remote_paths_raw:
                 if len(remote_paths_raw) > max_files:
                     logger.warning(
                         "Task %s produced > %d output files; truncating at %d. "
                         "Files past this index will NOT be downloaded or scored. "
                         "Raise GOKU_MAX_DOWNLOAD_FILES if needed.",
-                        instance_id, max_files, max_files,
+                        instance_id,
+                        max_files,
+                        max_files,
                     )
                     remote_paths_raw = remote_paths_raw[:max_files]
                 for remote_path in remote_paths_raw:
@@ -994,7 +1074,19 @@ class GokuEvaluation(Evaluation):
                     local_path.parent.mkdir(parents=True, exist_ok=True)
                     self._download_single_file(workspace, remote_path, local_path)
         except Exception as e:
-            logger.warning(f"Failed to list workspace files: {e}")
+            logger.warning(f"Failed to list/download workspace files: {e}")
+            # If NOTHING was retrieved, this is a total download failure (an
+            # infra error — command/connection failure, not a legitimately
+            # empty result). Clean our temp dir and re-raise so the harness
+            # RETRIES the instance instead of scoring it against zero output
+            # (which would record a false wrong-answer on a transient blip).
+            # A PARTIAL download is kept and scored as-is — better than failing.
+            any_downloaded = any(p.is_file() for p in output_dir.rglob("*"))
+            if not any_downloaded:
+                shutil.rmtree(output_dir, ignore_errors=True)
+                raise RuntimeError(
+                    f"Output download for {instance_id} retrieved no files: {e}"
+                ) from e
 
         return output_dir
 
@@ -1024,9 +1116,7 @@ class GokuEvaluation(Evaluation):
         except Exception as e:
             logger.warning(f"Base64 download failed for {remote_path}: {e}")
 
-    def _collect_file_contents(
-        self, output_dir: Path
-    ) -> tuple[str, list[str]]:
+    def _collect_file_contents(self, output_dir: Path) -> tuple[str, list[str]]:
         return collect_file_contents(output_dir)
 
     def _format_trajectory(self, events: Sequence[Event]) -> str:
@@ -1051,6 +1141,18 @@ class GokuEvaluation(Evaluation):
         return "\n".join(lines)
 
 
+def _resolve_secret(value: object) -> object:
+    """Unwrap a pydantic ``SecretStr``-like value to its plain string.
+
+    Returns ``value.get_secret_value()`` when that method exists, otherwise
+    returns ``value`` unchanged (covers plain ``str`` and ``None``).
+    """
+    getter = getattr(value, "get_secret_value", None)
+    if callable(getter):
+        return getter()
+    return value
+
+
 def main() -> None:
     """Main entry point for Goku evaluation."""
     # Eagerly apply httpx_patches — host-side only, always safe. Mirrors
@@ -1069,6 +1171,7 @@ def main() -> None:
     # render-pages-to-images fallback remains the working path; see Bug
     # A optimizations in media_render for the OOM mitigation.
     from benchmarks.utils import httpx_patches
+
     httpx_patches.apply()
 
     parser = get_parser()
@@ -1141,9 +1244,7 @@ def main() -> None:
     # the request with an opaque "Authentication failed" — surface the
     # override loudly instead.
     if llm.model.startswith("bedrock/"):
-        agent_key = getattr(llm, "api_key", None)
-        if hasattr(agent_key, "get_secret_value"):
-            agent_key = agent_key.get_secret_value()
+        agent_key = _resolve_secret(getattr(llm, "api_key", None))
         if agent_key:
             prior = os.environ.get("AWS_BEARER_TOKEN_BEDROCK")
             if prior and prior != str(agent_key):
@@ -1165,6 +1266,7 @@ def main() -> None:
     #   3) Fall back to model.replace("/", "_") (legacy behavior)
     def _resolve_model_display_name(config_path: str, llm_model: str) -> str:
         import json as _json
+
         try:
             with open(config_path, encoding="utf-8") as _f:
                 _raw = _json.load(_f)
@@ -1178,9 +1280,7 @@ def main() -> None:
             return stem
         return llm_model.replace("/", "_")
 
-    model_display_name = _resolve_model_display_name(
-        args.llm_config_path, llm.model
-    )
+    model_display_name = _resolve_model_display_name(args.llm_config_path, llm.model)
     logger.info(
         "Output directory display name: %s (actual model: %s)",
         model_display_name,
@@ -1234,9 +1334,13 @@ def main() -> None:
             council_details = {
                 "judge_council_models": [j.model for j in judge_council_llms],
                 "judge_council_api_keys": [
-                    (j.api_key.get_secret_value()
-                     if hasattr(j.api_key, "get_secret_value")
-                     else j.api_key) if j.api_key else None
+                    (
+                        j.api_key.get_secret_value()
+                        if hasattr(j.api_key, "get_secret_value")
+                        else j.api_key
+                    )
+                    if j.api_key
+                    else None
                     for j in judge_council_llms
                 ],
                 "judge_council_regions": [
@@ -1261,14 +1365,13 @@ def main() -> None:
                 "judge_council_display_names": None,
                 "judge_model": judge_llm.model if judge_llm else None,
                 "judge_api_key": (
-                    judge_llm.api_key.get_secret_value()
-                    if (judge_llm and hasattr(judge_llm.api_key, "get_secret_value"))
-                    else (judge_llm.api_key if judge_llm else None)
+                    _resolve_secret(judge_llm.api_key) if judge_llm else None
                 ),
                 "judge_region": (judge_llm.aws_region_name if judge_llm else None),
                 "judge_model_display_name": (
                     os.path.splitext(os.path.basename(args.judge_llm_config))[0]
-                    if args.judge_llm_config else None
+                    if args.judge_llm_config
+                    else None
                 ),
             }
 

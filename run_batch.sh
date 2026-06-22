@@ -175,10 +175,15 @@ JUDGE_COUNCIL_CONFIGS="${JUDGE_COUNCIL_CONFIGS:-${LLM_CONFIG_DIR}/claude-sonnet-
 
 # Execution parameters
 RUNS_PER_MODEL=3
-MAX_ITERATIONS=100         # Bumped from 30 — heavy multimodal tasks (PIL
-                           # compositing, multi-file generation) routinely
-                           # need 50-80 iterations to complete. 100 leaves
-                           # safe headroom under the 60-min conversation cap.
+MAX_ITERATIONS=150         # Step ceiling per run (one step = think→tool→observe),
+                           # NOT an image count. Typical tasks finish in 50-80
+                           # steps; heavy many-image tasks (PIL compositing,
+                           # multi-file generation, the 100-image class) can need
+                           # ~100-150. 150 gives those headroom without letting a
+                           # stuck agent run away — and at high step counts the
+                           # real cap becomes RUN_TIMEOUT (120 min) anyway, since
+                           # the kept first-message image payload is re-processed
+                           # every step.
 NUM_WORKERS=1              # Workers per model run (keep 1 for Docker stability)
 MAX_PARALLEL_MODELS=3      # How many models to run concurrently per task
 MAX_PARALLEL_TASKS=1       # How many tasks to run concurrently (1 = sequential)
@@ -208,7 +213,20 @@ RUN_TIMEOUT=7200           # Timeout per single run in seconds (120 min). Bumped
                            # Override with --timeout for genuinely long
                            # tasks.
 CONTAINER_STARTUP_WAIT=10  # Seconds to wait after Docker cleanup
-DOCKER_IMAGE="ghcr.io/openhands/agent-server:0f70e4e-nikolaik_s_python-nodejs_tag_python3.12-nodejs22-source"
+# NOTE: the upstream-pinned tag `0f70e4e-...-source` is not published (manifest
+# unknown). Default to the locally-available `380f144` image (same SDK build the
+# prior successful run used). Override with DOCKER_IMAGE=... if you build a newer one.
+DOCKER_IMAGE="${DOCKER_IMAGE:-ghcr.io/openhands/agent-server:380f144-nikolaik_s_python-nodejs_tag_python3.12-nodejs22}"
+
+# Portable timeout: GNU `timeout` (Linux) or `gtimeout` (macOS via
+# `brew install coreutils`). Empty if neither — runs without the watchdog.
+if command -v timeout &>/dev/null; then
+    TIMEOUT_CMD="timeout"
+elif command -v gtimeout &>/dev/null; then
+    TIMEOUT_CMD="gtimeout"
+else
+    TIMEOUT_CMD=""
+fi
 
 # Retry
 MAX_RETRIES_PER_RUN=2      # Retry a failed run this many times
@@ -446,38 +464,60 @@ cleanup_docker() {
 }
 
 kill_ghost_containers() {
-    # Kill containers that have been running longer than RUN_TIMEOUT.
-    # Under cross-task parallelism, sibling tasks' containers may be alive
-    # for legitimate reasons — skip this preemptive sweep entirely. The
-    # per-attempt `timeout` already enforces the per-run cap.
+    # Kill containers that have CLEARLY outlived the per-run cap — i.e. ghosts
+    # orphaned by a prior crashed run. Age is computed EXACTLY from each
+    # container's StartedAt rather than docker's humanised "RunningFor" text.
+    #
+    # Why exact age: the old logic matched "RunningFor" on `(hour|day)`, which
+    # fires at >=60 min regardless of RUN_TIMEOUT — so the intended cutoff was
+    # never honored and a healthy SIBLING model's container (60-120 min into a
+    # legitimate run, common with higher MAX_ITERATIONS) was force-removed
+    # mid-run by another model's pre-attempt sweep. docker's coarse buckets
+    # ("About an hour", "2 hours") also can't tell a healthy 100-min run from a
+    # 130-min ghost. Exact age fixes both.
+    #
+    # Under cross-task parallelism, sibling tasks' containers may be alive for
+    # legitimate reasons — skip this preemptive sweep entirely. The per-attempt
+    # `timeout` already enforces the per-run cap.
     if [[ "$MAX_PARALLEL_TASKS" -gt 1 ]]; then
         return 0
     fi
-    local long_runners
-    long_runners=$(docker ps --filter "ancestor=${DOCKER_IMAGE}" --format '{{.ID}} {{.RunningFor}}' 2>/dev/null || true)
-    if [[ -n "$long_runners" ]]; then
-        # Threshold scales with RUN_TIMEOUT: anything running longer than
-        # ~RUN_TIMEOUT minutes is a ghost from a prior crashed run.
-        local cutoff_minutes=$(( RUN_TIMEOUT / 60 ))
-        [[ $cutoff_minutes -lt 5 ]] && cutoff_minutes=5
-        while IFS= read -r line; do
-            local cid
-            cid=$(echo "$line" | awk '{print $1}')
-            # docker's RunningFor strings: "N seconds/minutes/hours/days ago"
-            # Match any "hour|day" or any minute-count >= cutoff_minutes.
-            if echo "$line" | grep -qE "(hour|day)"; then
-                docker rm -f "$cid" 2>/dev/null || true
-                log_warn "Killed ghost container: $cid"
-                continue
-            fi
-            local mins
-            mins=$(echo "$line" | grep -oE '[0-9]+ minute' | head -1 | awk '{print $1}')
-            if [[ -n "$mins" && "$mins" -ge "$cutoff_minutes" ]]; then
-                docker rm -f "$cid" 2>/dev/null || true
-                log_warn "Killed ghost container: $cid (age ${mins} min)"
-            fi
-        done <<< "$long_runners"
-    fi
+    local ids
+    ids=$(docker ps --filter "ancestor=${DOCKER_IMAGE}" --format '{{.ID}}' 2>/dev/null || true)
+    [[ -z "$ids" ]] && return 0
+
+    # Only reap containers older than the per-run cap plus a small grace, so a
+    # run that is seconds from being killed by its own `timeout` isn't raced.
+    local cutoff_seconds=$(( RUN_TIMEOUT + 120 ))
+    [[ $cutoff_seconds -lt 300 ]] && cutoff_seconds=300
+    local now_epoch
+    now_epoch=$(date +%s)
+
+    while IFS= read -r cid; do
+        [[ -z "$cid" ]] && continue
+        local started_at
+        started_at=$(docker inspect -f '{{.State.StartedAt}}' "$cid" 2>/dev/null || true)
+        [[ -z "$started_at" ]] && continue
+        # Parse RFC3339 UTC (e.g. 2026-06-22T11:23:53.123456789Z) → epoch.
+        # GNU date (Linux) parses it directly; fall back to BSD date (macOS),
+        # which needs fractional seconds + trailing 'Z' stripped and an
+        # explicit UTC interpretation so the epoch matches the 'Z' offset.
+        local clean="${started_at%%.*}"
+        clean="${clean%Z}"
+        local started_epoch
+        started_epoch=$(date -u -d "$started_at" +%s 2>/dev/null) \
+            || started_epoch=$(TZ=UTC date -j -f "%Y-%m-%dT%H:%M:%S" "$clean" +%s 2>/dev/null) \
+            || started_epoch=""
+        # Unparseable timestamp → leave it alone. Better to under-reap (the
+        # next sweep retries; cleanup_docker handles it once stopped) than to
+        # kill a container whose age we cannot establish.
+        [[ -z "$started_epoch" ]] && continue
+        local age=$(( now_epoch - started_epoch ))
+        if [[ "$age" -ge "$cutoff_seconds" ]]; then
+            docker rm -f "$cid" 2>/dev/null || true
+            log_warn "Killed ghost container: $cid (age $(( age / 60 )) min >= $(( cutoff_seconds / 60 )) min cutoff)"
+        fi
+    done <<< "$ids"
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -679,7 +719,7 @@ run_model_on_task() {
             local run_start
             run_start=$(date +%s)
 
-            if timeout "$RUN_TIMEOUT" uv run goku-infer "$model_config" \
+            if $TIMEOUT_CMD ${TIMEOUT_CMD:+$RUN_TIMEOUT} uv run goku-infer "$model_config" \
                 --tasks-dir dataset \
                 --task "$task" \
                 --runs 1 \
