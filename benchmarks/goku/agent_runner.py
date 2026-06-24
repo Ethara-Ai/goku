@@ -26,6 +26,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Sequence
 
+from benchmarks.goku.config import INFER_DEFAULTS
 from benchmarks.utils.constants import EVAL_AGENT_SERVER_IMAGE
 from benchmarks.utils.fake_user_response import (
     run_conversation_with_fake_user_response,
@@ -42,6 +43,7 @@ from openhands.sdk import (
     TextContent,
     get_logger,
 )
+from openhands.sdk.context.condenser import CondenserBase, LLMSummarizingCondenser
 from openhands.sdk.event import ActionEvent
 from openhands.sdk.tool.builtins.finish import FinishAction
 from openhands.sdk.workspace import RemoteWorkspace
@@ -49,6 +51,70 @@ from openhands.tools.preset.default import get_default_tools
 
 
 logger = get_logger(__name__)
+
+
+# Event-count backstop used only when a token budget is active. Set high enough
+# that token usage — not a fixed turn/event count — is what triggers
+# condensation ("no capping" on turns).
+_CONDENSER_EVENT_BACKSTOP = 100_000
+
+
+def _resolve_context_window(llm: Any) -> int | None:
+    """Best-effort lookup of a model's context window (max input tokens).
+
+    Tries the explicit `max_input_tokens` field first, then the litellm-derived
+    model info. Returns None when neither is available, in which case callers
+    fall back to the event-count threshold so headroom is never lost.
+    """
+    window = getattr(llm, "max_input_tokens", None)
+    if window:
+        return window
+    info = getattr(llm, "_model_info", None)
+    if isinstance(info, dict):
+        return info.get("max_input_tokens") or info.get("max_tokens")
+    return None
+
+
+def build_summarizing_condenser(
+    llm: Any,
+    *,
+    enable_condenser: bool = INFER_DEFAULTS["enable_condenser"],
+    condenser_token_fraction: float = INFER_DEFAULTS["condenser_token_fraction"],
+    condenser_max_size: int = INFER_DEFAULTS["condenser_max_size"],
+    condenser_keep_first: int = INFER_DEFAULTS["condenser_keep_first"],
+) -> CondenserBase | None:
+    """Build the context-window-headroom condenser, or None when disabled.
+
+    Triggering is driven by the model's *actual* context window rather than a
+    fixed turn/event count: the condenser fires once token usage exceeds
+    `condenser_token_fraction` of the resolved context window. The event-count
+    threshold is kept only as a backstop and is pushed out of the way whenever a
+    token budget can be resolved. If the window can't be resolved (e.g. an
+    offline/mocked LLM), we fall back to the event-count threshold so the
+    pipeline never loses headroom protection.
+
+    The summarizer LLM is built with usage_id="condenser" so its token spend is
+    tracked separately from the agent. `condenser=None` (disabled) preserves the
+    pre-headroom behavior exactly.
+    """
+    if not enable_condenser:
+        return None
+
+    condenser_llm = build_eval_llm(llm, usage_id="condenser")
+    context_window = _resolve_context_window(condenser_llm)
+    max_tokens = (
+        int(condenser_token_fraction * context_window) if context_window else None
+    )
+    # Token budget active -> raise the event cap out of the way so token usage is
+    # the effective trigger. Otherwise keep the configured event threshold.
+    max_size = _CONDENSER_EVENT_BACKSTOP if max_tokens else condenser_max_size
+
+    return LLMSummarizingCondenser(
+        llm=condenser_llm,
+        max_tokens=max_tokens,
+        max_size=max_size,
+        keep_first=condenser_keep_first,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -291,6 +357,7 @@ def run_agent(
     input_files: list[str],
     instance_id: str,
     max_iterations: int,
+    condenser: CondenserBase | None = None,
 ) -> AgentRunResult:
     """Build Agent + Conversation, send the (optionally multimodal) message,
     drive the conversation to FinishAction, extract the final text response,
@@ -303,7 +370,12 @@ def run_agent(
     image_urls = _collect_image_urls(input_files)
 
     tools = get_default_tools(enable_browser=False)
-    agent = Agent(llm=agent_llm, tools=tools, system_prompt_kwargs={"cli_mode": True})
+    agent = Agent(
+        llm=agent_llm,
+        tools=tools,
+        system_prompt_kwargs={"cli_mode": True},
+        condenser=condenser,
+    )
 
     conversation = Conversation(
         agent=agent,
@@ -354,15 +426,30 @@ def run_single_task(
     instance_id: str,
     max_iterations: int,
     forward_env: list[str] | None = None,
+    enable_condenser: bool = INFER_DEFAULTS["enable_condenser"],
+    condenser_token_fraction: float = INFER_DEFAULTS["condenser_token_fraction"],
+    condenser_max_size: int = INFER_DEFAULTS["condenser_max_size"],
+    condenser_keep_first: int = INFER_DEFAULTS["condenser_keep_first"],
 ) -> AgentRunResult:
     """One-shot convenience: build workspace, upload files, run agent.
 
     `llm` is the raw LLM config returned by `load_llm_config(...)`; this
     function applies `build_eval_llm` internally so callers (the service in
     particular) don't have to know about that transform.
+
+    Context-window headroom (condensation) defaults to the harness-wide
+    settings in `INFER_DEFAULTS`; pass `enable_condenser=False` to disable.
     """
     workspace = prepare_agent_workspace(input_files, forward_env=forward_env)
     agent_llm = build_eval_llm(llm)
+    condenser = build_summarizing_condenser(
+        llm,
+        enable_condenser=enable_condenser,
+        condenser_token_fraction=condenser_token_fraction,
+        condenser_max_size=condenser_max_size,
+        condenser_keep_first=condenser_keep_first,
+    )
+
     return run_agent(
         workspace=workspace,
         agent_llm=agent_llm,
@@ -370,6 +457,7 @@ def run_single_task(
         input_files=input_files,
         instance_id=instance_id,
         max_iterations=max_iterations,
+        condenser=condenser,
     )
 
 

@@ -82,6 +82,16 @@ class EvalMetadata(BaseModel):
         default=True,
         description="Enable the context condenser to manage conversation history",
     )
+    condenser_token_fraction: float = Field(
+        default=0.8,
+        gt=0.0,
+        le=1.0,
+        description=(
+            "Fraction of the model's context window at which the condenser "
+            "activates. Token-usage driven (not a fixed event count); "
+            "condenser_max_size is only a fallback when the window is unknown."
+        ),
+    )
     condenser_max_size: int = Field(
         default=240,
         ge=1,

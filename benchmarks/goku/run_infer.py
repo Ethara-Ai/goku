@@ -22,6 +22,7 @@ from typing import List, Sequence
 
 from dotenv import load_dotenv
 
+from benchmarks.goku.agent_runner import build_summarizing_condenser
 from benchmarks.goku.config import INFER_DEFAULTS
 from benchmarks.goku.judge_context import collect_file_contents
 from benchmarks.goku.media_render import video_to_keyframes
@@ -645,10 +646,23 @@ class GokuEvaluation(Evaluation):
         agent_llm = build_eval_llm(self.metadata.llm)
         tools = get_default_tools(enable_browser=False)
 
+        # Context-window headroom: condense conversation history when token usage
+        # approaches the model's real context window (token-budget driven, not a
+        # fixed event count). `condenser=None` (when disabled) preserves the
+        # previous behavior.
+        condenser = build_summarizing_condenser(
+            self.metadata.llm,
+            enable_condenser=self.metadata.enable_condenser,
+            condenser_token_fraction=self.metadata.condenser_token_fraction,
+            condenser_max_size=self.metadata.condenser_max_size,
+            condenser_keep_first=self.metadata.condenser_keep_first,
+        )
+
         agent = Agent(
             llm=agent_llm,
             tools=tools,
             system_prompt_kwargs={"cli_mode": True},
+            condenser=condenser,
         )
 
         # Create conversation
@@ -1397,6 +1411,10 @@ def main() -> None:
             selected_instances_file=getattr(args, "select", None),
             max_retries=args.max_retries,
             workspace_type=args.workspace,
+            enable_condenser=args.enable_condenser,
+            condenser_token_fraction=args.condenser_token_fraction,
+            condenser_max_size=args.condenser_max_size,
+            condenser_keep_first=args.condenser_keep_first,
         )
 
         evaluator = GokuEvaluation(metadata=metadata, num_workers=args.num_workers)

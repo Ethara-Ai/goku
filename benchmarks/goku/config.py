@@ -12,6 +12,11 @@ INFER_DEFAULTS = {
     "task_timeout_seconds": 600,  # 10 minutes per task run
     "max_retries": 2,
     "enable_condenser": True,
+    # Context-window headroom triggers on the model's ACTUAL token budget, not a
+    # fixed turn/event count: the condenser fires once context usage exceeds this
+    # fraction of the model's real context window. `condenser_max_size` is only a
+    # fallback event cap for when the context window can't be resolved.
+    "condenser_token_fraction": 0.8,
     "condenser_max_size": 240,
     "condenser_keep_first": 2,
     "judge_temperature": 0.0,
