@@ -46,6 +46,7 @@ logger = logging.getLogger(__name__)
 
 _PATCHED = False
 _LITELLM_OPUS_47_PATCHED = False
+_LITELLM_THINKING_NONE_PATCHED = False
 DocumentContent = None  # populated by apply()
 
 # Bedrock application-inference-profile IDs that resolve to Claude Opus 4.7
@@ -57,9 +58,7 @@ DocumentContent = None  # populated by apply()
 # Extend this tuple as new profile IDs are provisioned. The env var
 # ``GOKU_OPUS_47_INFERENCE_PROFILE_IDS`` (comma-separated) is merged in at
 # patch time for one-off operator overrides without a code change.
-_KNOWN_OPUS_47_PROFILE_IDS: tuple[str, ...] = (
-    "653flds7ip4s",
-)
+_KNOWN_OPUS_47_PROFILE_IDS: tuple[str, ...] = ("653flds7ip4s",)
 
 
 def apply() -> bool:
@@ -74,8 +73,9 @@ def apply() -> bool:
     try:
         # Late import — at sitecustomize time, the SDK module is importable
         # but the import is *cheap* because we only need its base types.
-        from openhands.sdk.llm import message as _msg
         from pydantic import ConfigDict
+
+        from openhands.sdk.llm import message as _msg
     except ImportError:
         return False
 
@@ -137,8 +137,10 @@ def apply() -> bool:
     # 2-3 validation attempts per content block AND is fragile if a future
     # ImageContent change weakens its `extra` config. The discriminated form
     # is the recommended pydantic pattern for tagged unions like this.
-    from pydantic import Field
     from typing import Annotated, Union
+
+    from pydantic import Field
+
     new_union = Sequence[
         Annotated[
             Union[_msg.TextContent, _msg.ImageContent, _DocumentContent],
@@ -152,7 +154,8 @@ def apply() -> bool:
         logger.warning(
             "Failed to extend openhands.sdk.llm.message.Message.content with "
             "DocumentContent (%s). Native PDF on the agent side will not be "
-            "available; rendering-to-images is still possible.", exc,
+            "available; rendering-to-images is still possible.",
+            exc,
         )
         return False
 
@@ -171,6 +174,63 @@ def apply() -> bool:
     # this fix.
     _patch_litellm_opus_47_detection()
 
+    # Independent sub-patch: make LiteLLM's thinking-detection None-safe so a
+    # ``thinking=None`` param can't crash the completion call. Tracked on its
+    # own sentinel for the same reason as the Opus 4.7 detection patch.
+    _patch_litellm_thinking_none_safety()
+
+    return True
+
+
+def _patch_litellm_thinking_none_safety() -> bool:
+    """Make LiteLLM's ``is_thinking_enabled`` tolerate a ``None`` thinking param.
+
+    Why
+    ---
+    ``BaseConfig.is_thinking_enabled`` (and the Anthropic path that calls it via
+    ``update_optional_params_with_thinking_tokens``) does::
+
+        non_default_params.get("thinking", {}).get("type") == "enabled"
+
+    The ``{}`` default only applies when the ``"thinking"`` key is *absent*. When
+    the key is *present but ``None``* — which happens for Claude when
+    ``reasoning_effort`` maps to ``None`` (e.g. ``"none"``) or the adaptive-thinking
+    path leaves ``optional_params["thinking"] = None`` — ``.get("type")`` raises
+    ``AttributeError: 'NoneType' object has no attribute 'get'``. The agent-server
+    container bundles a LiteLLM version with this bug, so every completion (the
+    agent loop *and* conversation-title generation) dies in ~3s before any output
+    is written, surfacing to the harness as "finished but no scores.jsonl".
+
+    Newer LiteLLM guards this with ``(... .get("thinking") or {})``; this patch
+    backports that behavior by wrapping ``is_thinking_enabled`` to coerce a
+    ``None`` thinking value to an empty dict before the original runs.
+
+    Returns ``True`` if newly applied this call, ``False`` if already applied or
+    LiteLLM isn't importable.
+    """
+    global _LITELLM_THINKING_NONE_PATCHED
+    if _LITELLM_THINKING_NONE_PATCHED:
+        return False
+    try:
+        from litellm.llms.base_llm.chat.transformation import BaseConfig
+    except ImportError:
+        logger.debug("LiteLLM not importable; skipping thinking-None-safety patch.")
+        return False
+
+    _orig_is_thinking_enabled = BaseConfig.is_thinking_enabled
+
+    def _is_thinking_enabled_patched(self, non_default_params: dict) -> bool:
+        # Coerce a present-but-None 'thinking' to absent so the original's
+        # ``.get("thinking", {}).get("type")`` can't dereference None.
+        if non_default_params.get("thinking", False) is None:
+            non_default_params = {
+                k: v for k, v in non_default_params.items() if k != "thinking"
+            }
+        return _orig_is_thinking_enabled(self, non_default_params)
+
+    BaseConfig.is_thinking_enabled = _is_thinking_enabled_patched
+    _LITELLM_THINKING_NONE_PATCHED = True
+    logger.info("Applied LiteLLM thinking-None-safety patch.")
     return True
 
 
@@ -215,9 +275,7 @@ def _patch_litellm_opus_47_detection() -> bool:
     env_override = os.getenv("GOKU_OPUS_47_INFERENCE_PROFILE_IDS", "").strip()
     if env_override:
         extra_ids = extra_ids + tuple(
-            tok.strip().lower()
-            for tok in env_override.split(",")
-            if tok.strip()
+            tok.strip().lower() for tok in env_override.split(",") if tok.strip()
         )
 
     _orig_is_47 = AnthropicModelInfo._is_claude_4_7_model
@@ -249,3 +307,8 @@ def is_applied() -> bool:
 def is_litellm_opus_47_patched() -> bool:
     """Return whether the LiteLLM Opus 4.7 detection patch is installed."""
     return _LITELLM_OPUS_47_PATCHED
+
+
+def is_litellm_thinking_none_patched() -> bool:
+    """Return whether the LiteLLM thinking-None-safety patch is installed."""
+    return _LITELLM_THINKING_NONE_PATCHED

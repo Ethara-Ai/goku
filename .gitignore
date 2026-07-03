@@ -288,3 +288,38 @@ docs/
 # Handoff folders / tarballs for colleagues (large output deliveries — never commit)
 goku_scoring_handoff_*/
 goku_scoring_handoff_*.tar.gz
+
+# Trinity ENGRAM trust-root HMAC secret — never commit
+memory/roots.yaml
+
+# FORGE release signer secret — never commit
+seed/release_roots.yaml
+
+# Trinity - on progress - never commit
+trinity/
+seed/
+samples/
+research/
+requirements/
+memory/
+eval_out/
+audit/
+.agents/
+.opencode/
+scripts/
+.github/CODEOWNERS
+
+# Trinity - in-progress docs / run artifacts (never commit)
+CHARTER.md
+CODE_OF_CONDUCT.md
+DIRECTIVE.md
+EDICT.md
+GLOSSARY.md
+GROUNDING.md
+INDEX.md
+OPERATIONS.md
+PIPELINE.md
+RESEARCH.md
+SECURITY.md
+TAXONOMY.md
+VERDICT.md

@@ -213,10 +213,14 @@ RUN_TIMEOUT=7200           # Timeout per single run in seconds (120 min). Bumped
                            # Override with --timeout for genuinely long
                            # tasks.
 CONTAINER_STARTUP_WAIT=10  # Seconds to wait after Docker cleanup
-# NOTE: the upstream-pinned tag `0f70e4e-...-source` is not published (manifest
-# unknown). Default to the locally-available `380f144` image (same SDK build the
-# prior successful run used). Override with DOCKER_IMAGE=... if you build a newer one.
-DOCKER_IMAGE="${DOCKER_IMAGE:-ghcr.io/openhands/agent-server:380f144-nikolaik_s_python-nodejs_tag_python3.12-nodejs22}"
+# NOTE: pin to the SDK commit (380f144 = v1.22.0-20-g380f1449, the vendored
+# submodule). For that commit CI only published the `python3.13-nodejs22-slim`
+# variant (matching the agent-server Dockerfile's BASE_IMAGE default); the
+# `python3.12-nodejs22` tag was never built for this SHA, hence the registry
+# "not found" on pull. This arch-less tag is a multi-arch OCI index (linux
+# amd64+arm64), so it pulls on both Intel and Apple Silicon. Override with
+# DOCKER_IMAGE=... if you build/publish a newer one.
+DOCKER_IMAGE="${DOCKER_IMAGE:-ghcr.io/openhands/agent-server:380f144-nikolaik_s_python-nodejs_tag_python3.13-nodejs22-slim}"
 
 # Portable timeout: GNU `timeout` (Linux) or `gtimeout` (macOS via
 # `brew install coreutils`). Empty if neither — runs without the watchdog.
