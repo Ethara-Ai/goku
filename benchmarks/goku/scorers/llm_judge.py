@@ -12,7 +12,6 @@ import base64
 import hashlib
 import json
 import logging
-import os
 import re
 import time
 from pathlib import Path
@@ -38,12 +37,12 @@ LLM_JUDGE_TYPES = frozenset({"response_criteria", "response_not_criteria"})
 # verdict) and bias the judge. The delimiters are deliberately unusual so
 # they are unlikely to be produced by accident; any literal occurrence in
 # the input is escaped before fencing.
-_FENCE_RESPONSE_OPEN  = "<<<<< AGENT_RESPONSE_BEGIN >>>>>"
+_FENCE_RESPONSE_OPEN = "<<<<< AGENT_RESPONSE_BEGIN >>>>>"
 _FENCE_RESPONSE_CLOSE = "<<<<< AGENT_RESPONSE_END >>>>>"
-_FENCE_FILES_OPEN     = "<<<<< OUTPUT_FILES_BEGIN >>>>>"
-_FENCE_FILES_CLOSE    = "<<<<< OUTPUT_FILES_END >>>>>"
-_FENCE_TRAJ_OPEN      = "<<<<< TRAJECTORY_BEGIN >>>>>"
-_FENCE_TRAJ_CLOSE     = "<<<<< TRAJECTORY_END >>>>>"
+_FENCE_FILES_OPEN = "<<<<< OUTPUT_FILES_BEGIN >>>>>"
+_FENCE_FILES_CLOSE = "<<<<< OUTPUT_FILES_END >>>>>"
+_FENCE_TRAJ_OPEN = "<<<<< TRAJECTORY_BEGIN >>>>>"
+_FENCE_TRAJ_CLOSE = "<<<<< TRAJECTORY_END >>>>>"
 
 
 def _fence(text: str, open_marker: str, close_marker: str) -> str:
@@ -51,6 +50,7 @@ def _fence(text: str, open_marker: str, close_marker: str) -> str:
     occurrence of the fence so the agent can't close it early."""
     escaped = text.replace("<<<<<", "<◇<◇<").replace(">>>>>", ">◇>◇>")
     return f"{open_marker}\n{escaped}\n{close_marker}"
+
 
 # Supported media types for the multimodal judge payload.
 _IMAGE_MIME_BY_SUFFIX = {
@@ -87,7 +87,7 @@ _VIDEO_SUFFIXES = {".mp4", ".mov", ".webm", ".avi", ".mkv"}
 # long-term fix and let us lower this back down.
 _MAX_MEDIA_PER_CALL = 350
 _MAX_IMAGE_BYTES = 16_000_000  # 16 MB (was 4 MB — too tight for multi-MP outputs)
-_MAX_PDF_BYTES = 30_000_000    # 30 MB (Anthropic limit is 32 MB)
+_MAX_PDF_BYTES = 30_000_000  # 30 MB (Anthropic limit is 32 MB)
 # Total media-payload cap across all blocks in ONE judge call. Without this
 # cap a 60-keyframe video (~1-3 MB/frame) plus a 30 MB PDF could push the
 # request past Gemini's ~100 MB inline-data ceiling and trigger silent
@@ -139,22 +139,22 @@ def _image_url_block(path: Path) -> dict:
 # rubrics on the same video reuse one upload (~30s saved per rubric on
 # a 200 MB video; 4 LLM rubrics → ~2 min saved per task).
 
-_GEMINI_FILE_UPLOAD_TIMEOUT_SEC = 600.0   # 10 min. Was 300s — empirically too
-                                          # tight: on 2026-05-22 the same 200
-                                          # MB Cars.mp4 video succeeded in 149s
-                                          # on one upload but timed out at 300s
-                                          # in PROCESSING on another (Gemini's
-                                          # server-side video sampling has wide
-                                          # variance). The judge then fell back
-                                          # to ffmpeg keyframes — correct
-                                          # behavior but lower fidelity. 600s
-                                          # covers the observed worst case
-                                          # (~3 min upload + ~5-7 min PROCESSING
-                                          # for a 200 MB / 40-min H.264 file)
-                                          # while still failing-fast on a
-                                          # genuinely stuck upload.
+_GEMINI_FILE_UPLOAD_TIMEOUT_SEC = 600.0  # 10 min. Was 300s — empirically too
+# tight: on 2026-05-22 the same 200
+# MB Cars.mp4 video succeeded in 149s
+# on one upload but timed out at 300s
+# in PROCESSING on another (Gemini's
+# server-side video sampling has wide
+# variance). The judge then fell back
+# to ffmpeg keyframes — correct
+# behavior but lower fidelity. 600s
+# covers the observed worst case
+# (~3 min upload + ~5-7 min PROCESSING
+# for a 200 MB / 40-min H.264 file)
+# while still failing-fast on a
+# genuinely stuck upload.
 _GEMINI_FILE_POLL_INTERVAL_SEC = 2.0
-_GEMINI_FILE_CACHE_TTL_SEC = 24 * 3600    # Files API server-side TTL is 48h
+_GEMINI_FILE_CACHE_TTL_SEC = 24 * 3600  # Files API server-side TTL is 48h
 
 # In-process cache: (path_str, size, mtime_ns, api_key_short_hash) →
 #   (file_uri, mime_type, upload_timestamp). Module-level so it survives
@@ -171,9 +171,7 @@ _VIDEO_MIME_BY_SUFFIX = {
 }
 
 
-def _gemini_file_cache_key(
-    path: Path, api_key: str
-) -> tuple[str, int, int, str]:
+def _gemini_file_cache_key(path: Path, api_key: str) -> tuple[str, int, int, str]:
     """Stat-based cache key — orders of magnitude faster than hashing a
     200 MB file. Stat-equal videos are content-equal in practice (an edit
     bumps mtime). api_key is hashed because Files are scoped per key."""
@@ -195,9 +193,7 @@ def _upload_video_to_gemini(
     keyframe path so a single transient network glitch doesn't tank a
     judge run.
     """
-    mime = _VIDEO_MIME_BY_SUFFIX.get(
-        video_path.suffix.lower(), "video/mp4"
-    )
+    mime = _VIDEO_MIME_BY_SUFFIX.get(video_path.suffix.lower(), "video/mp4")
 
     cache_key = _gemini_file_cache_key(video_path, api_key)
     cached = _GEMINI_FILE_CACHE.get(cache_key)
@@ -206,7 +202,9 @@ def _upload_video_to_gemini(
         if time.time() - upload_time < _GEMINI_FILE_CACHE_TTL_SEC:
             logger.info(
                 "Gemini Files API cache hit for %s (uri=%s, age=%.0fs)",
-                video_path.name, uri, time.time() - upload_time,
+                video_path.name,
+                uri,
+                time.time() - upload_time,
             )
             return uri, cached_mime
         # Expired locally; let the server re-issue.
@@ -223,7 +221,8 @@ def _upload_video_to_gemini(
     client = genai.Client(api_key=api_key)
     logger.info(
         "Uploading %s (%.1f MB) to Gemini Files API…",
-        video_path.name, video_path.stat().st_size / 1_000_000,
+        video_path.name,
+        video_path.stat().st_size / 1_000_000,
     )
     t0 = time.time()
     file_ref = client.files.upload(file=str(video_path))
@@ -248,7 +247,9 @@ def _upload_video_to_gemini(
     elapsed = time.time() - t0
     logger.info(
         "Gemini Files API upload OK: name=%s uri=%s elapsed=%.1fs",
-        file_ref.name, file_ref.uri, elapsed,
+        file_ref.name,
+        file_ref.uri,
+        elapsed,
     )
     _GEMINI_FILE_CACHE[cache_key] = (file_ref.uri, mime, time.time())
     return file_ref.uri, mime
@@ -313,35 +314,40 @@ def _build_media_blocks(
     # Falls through to the regular per-file loop on any failure (e.g.,
     # AWS creds missing) — caller sees the same inline path.
     if task_key:
-        image_paths = [Path(p) for p in paths
-                       if Path(p).is_file()
-                       and Path(p).suffix.lower() in _IMAGE_MIME_BY_SUFFIX]
+        image_paths = [
+            Path(p)
+            for p in paths
+            if Path(p).is_file() and Path(p).suffix.lower() in _IMAGE_MIME_BY_SUFFIX
+        ]
         try:
             from benchmarks.goku.image_hosting import (
-                should_use_url_hosting, upload_task_images,
                 s3_hosting_configured,
+                should_use_url_hosting,
+                upload_task_images,
             )
+
             if should_use_url_hosting(image_paths) and s3_hosting_configured():
-                hosted = upload_task_images(image_paths=image_paths,
-                                            task_key=task_key)
+                hosted = upload_task_images(image_paths=image_paths, task_key=task_key)
                 blocks.extend(
-                    {"type": "image_url", "image_url": {"url": u}}
-                    for u in hosted.urls
+                    {"type": "image_url", "image_url": {"url": u}} for u in hosted.urls
                 )
                 # Drain hosted images from paths so the regular loop only
                 # handles non-image inputs (PDFs, videos). Comparison by
                 # resolved path because paths may be strings or Paths.
                 hosted_resolved = {str(p.resolve()) for p in image_paths}
-                paths = [p for p in paths
-                         if str(Path(p).resolve()) not in hosted_resolved]
+                paths = [
+                    p for p in paths if str(Path(p).resolve()) not in hosted_resolved
+                ]
                 logger.info(
-                    "_build_media_blocks: hosted %d input images via S3 "
-                    "(task_key=%s)", len(hosted.urls), task_key,
+                    "_build_media_blocks: hosted %d input images via S3 (task_key=%s)",
+                    len(hosted.urls),
+                    task_key,
                 )
         except Exception as e:
             logger.warning(
                 "URL-hosting short-circuit failed (%s); falling back to "
-                "inline base64 for all media", e,
+                "inline base64 for all media",
+                e,
             )
 
     # Running byte total across blocks added so far. Used to bound the
@@ -401,8 +407,9 @@ def _build_media_blocks(
                     f"{_MAX_TOTAL_MEDIA_BYTES:,}); cap reached"
                 )
                 logger.info(msg)
-                warnings.append("judge media total-bytes cap reached; "
-                                "remaining inputs skipped")
+                warnings.append(
+                    "judge media total-bytes cap reached; remaining inputs skipped"
+                )
                 break
             blocks.append(_image_url_block(path))
             total_bytes += size
@@ -423,27 +430,32 @@ def _build_media_blocks(
                         f"{_MAX_TOTAL_MEDIA_BYTES:,}); cap reached"
                     )
                     logger.info(msg)
-                    warnings.append("judge media total-bytes cap reached; "
-                                    "remaining inputs skipped")
+                    warnings.append(
+                        "judge media total-bytes cap reached; remaining inputs skipped"
+                    )
                     break
                 b64 = base64.b64encode(path.read_bytes()).decode("ascii")
                 if provider == "bedrock_anthropic":
-                    blocks.append({
-                        "type": "document",
-                        "source": {
-                            "type": "base64",
-                            "media_type": "application/pdf",
-                            "data": b64,
-                        },
-                    })
+                    blocks.append(
+                        {
+                            "type": "document",
+                            "source": {
+                                "type": "base64",
+                                "media_type": "application/pdf",
+                                "data": b64,
+                            },
+                        }
+                    )
                 else:  # openai / gemini
-                    blocks.append({
-                        "type": "file",
-                        "file": {
-                            "filename": path.name,
-                            "file_data": f"data:application/pdf;base64,{b64}",
-                        },
-                    })
+                    blocks.append(
+                        {
+                            "type": "file",
+                            "file": {
+                                "filename": path.name,
+                                "file_data": f"data:application/pdf;base64,{b64}",
+                            },
+                        }
+                    )
                 total_bytes += size
             else:
                 # Kimi-on-Bedrock or unknown — render pages to images.
@@ -477,14 +489,9 @@ def _build_media_blocks(
             # and avoid false-positive hallucination flags on cars the
             # agent saw briefly. The agent intentionally has a sparser
             # view — that is the test.
-            if (
-                supports_native_video(judge_model, judge_canonical)
-                and judge_api_key
-            ):
+            if supports_native_video(judge_model, judge_canonical) and judge_api_key:
                 try:
-                    file_uri, mime = _upload_video_to_gemini(
-                        path, judge_api_key
-                    )
+                    file_uri, mime = _upload_video_to_gemini(path, judge_api_key)
                 except Exception as exc:
                     # Any failure (auth, timeout, network, dependency
                     # missing) drops through to keyframes. Better a
@@ -503,8 +510,9 @@ def _build_media_blocks(
                     blocks.append(_gemini_video_block(file_uri, mime))
                     total_bytes += 1024
                     logger.info(
-                        "Judge using native Gemini video for %s "
-                        "(file_uri=%s)", path.name, file_uri,
+                        "Judge using native Gemini video for %s (file_uri=%s)",
+                        path.name,
+                        file_uri,
                     )
                     continue
 
@@ -540,6 +548,7 @@ def _build_media_blocks(
         warnings.append(msg)
 
     return blocks, warnings
+
 
 # Prompt template for response_criteria
 # CRITICAL: the prompt MUST distinguish INPUT media (task fixture) from
@@ -740,10 +749,9 @@ def _score_llm_judge_single(
 
     # Re-label warnings so the operator can tell which section dropped a
     # file (e.g. a corrupt OUTPUT video vs. an oversized INPUT image).
-    media_warnings = (
-        [f"INPUT: {w}" for w in input_warnings]
-        + [f"OUTPUT: {w}" for w in output_warnings]
-    )
+    media_warnings = [f"INPUT: {w}" for w in input_warnings] + [
+        f"OUTPUT: {w}" for w in output_warnings
+    ]
 
     # Hard refusal when the per-call media cap was hit: a verdict computed
     # on truncated context is worse than no verdict — it silently lands in
@@ -779,9 +787,21 @@ def _score_llm_judge_single(
     prompt = prompt_template.format(
         media_note=media_note,
         criterion=item.criterion,
-        response=_fence(response[:_PROMPT_RESPONSE_MAX_CHARS], _FENCE_RESPONSE_OPEN, _FENCE_RESPONSE_CLOSE),
-        file_contents=_fence(file_contents[:_PROMPT_FILE_CONTENTS_MAX_CHARS], _FENCE_FILES_OPEN, _FENCE_FILES_CLOSE),
-        trajectory=_fence(trajectory[:_PROMPT_TRAJECTORY_MAX_CHARS], _FENCE_TRAJ_OPEN, _FENCE_TRAJ_CLOSE),
+        response=_fence(
+            response[:_PROMPT_RESPONSE_MAX_CHARS],
+            _FENCE_RESPONSE_OPEN,
+            _FENCE_RESPONSE_CLOSE,
+        ),
+        file_contents=_fence(
+            file_contents[:_PROMPT_FILE_CONTENTS_MAX_CHARS],
+            _FENCE_FILES_OPEN,
+            _FENCE_FILES_CLOSE,
+        ),
+        trajectory=_fence(
+            trajectory[:_PROMPT_TRAJECTORY_MAX_CHARS],
+            _FENCE_TRAJ_OPEN,
+            _FENCE_TRAJ_CLOSE,
+        ),
     )
 
     # Construct the message content.
@@ -798,22 +818,25 @@ def _score_llm_judge_single(
     if has_any_media:
         message_parts: list[dict] = [{"type": "text", "text": prompt}]
         if input_blocks:
-            message_parts.append({
-                "type": "text",
-                "text": (
-                    "\n=== INPUT MEDIA "
-                    "(the task fixture given to the agent) ===\n"
-                ),
-            })
+            message_parts.append(
+                {
+                    "type": "text",
+                    "text": (
+                        "\n=== INPUT MEDIA (the task fixture given to the agent) ===\n"
+                    ),
+                }
+            )
             message_parts.extend(input_blocks)
         if output_blocks:
-            message_parts.append({
-                "type": "text",
-                "text": (
-                    "\n=== OUTPUT MEDIA "
-                    "(files the agent produced as its work product) ===\n"
-                ),
-            })
+            message_parts.append(
+                {
+                    "type": "text",
+                    "text": (
+                        "\n=== OUTPUT MEDIA "
+                        "(files the agent produced as its work product) ===\n"
+                    ),
+                }
+            )
             message_parts.extend(output_blocks)
         message_content: str | list[dict] = message_parts
     else:
@@ -846,6 +869,15 @@ def _score_llm_judge_single(
             "messages": [{"role": "user", "content": message_content}],
             "max_tokens": 16384,
             "response_format": {"type": "json_object"},
+            # A transient judge failure (429 / 5xx / connection reset / timeout)
+            # otherwise falls through to `passed=False` and silently corrupts the
+            # score. LiteLLM retries retryable errors internally with exponential
+            # backoff; this does NOT change scoring semantics, it only makes the
+            # error path rare. `timeout` bounds a hung provider connection (matches
+            # the 120s the /judge service path already uses) — kept generous so a
+            # legitimately slow multimodal/PDF verdict is not turned into an error.
+            "num_retries": 4,
+            "timeout": 120,
         }
         _model_lc = judge_model.lower()
         if "gpt-5" in _model_lc and "gpt-5.5" not in _model_lc:
@@ -910,6 +942,7 @@ def _score_llm_judge_single(
             # designed exactly for this LLM-output cleanup.
             try:
                 import json_repair  # local import to keep cold-import light
+
                 repaired = json_repair.loads(cleaned)
             except Exception:
                 # Repair failed too — fall through to the outer JSONDecodeError
@@ -922,10 +955,12 @@ def _score_llm_judge_single(
             logger.info(
                 "Judge JSON repair succeeded for item #%d "
                 "(strict json.loads failed: %s)",
-                item.number, _strict_err,
+                item.number,
+                _strict_err,
             )
         criteria_met = bool(result.get("criteria_met", False))
         reasoning = str(result.get("reasoning", "No reasoning provided"))
+        error: str | None = None
 
     except json.JSONDecodeError as e:
         logger.warning(
@@ -936,10 +971,14 @@ def _score_llm_judge_single(
         )
         criteria_met = False
         reasoning = f"Judge returned invalid JSON: {raw_content[:200]}"
+        # A non-verdict, not a genuine miss. Aggregation still treats this as a
+        # conservative passed=False, but the error flag lets rescore re-judge it.
+        error = f"unparseable judge output: {e}"
     except Exception as e:
         logger.exception("LLM judge call failed for item #%d", item.number)
         criteria_met = False
         reasoning = f"Judge call failed: {e}"
+        error = f"judge call failed (retries exhausted): {e}"
 
     # Map criteria_met to passed + points
     # For response_criteria: criteria_met=True → passed=True (positive)
@@ -966,6 +1005,7 @@ def _score_llm_judge_single(
         judge_rationale=reasoning,
         points_awarded=points_awarded,
         judge_cost_usd=judge_cost_usd,
+        error=error,
     )
 
 
@@ -1123,16 +1163,20 @@ def score_llm_judge(
     benchmarks where stochasticity is acceptable.
     """
     kwargs = dict(
-        item=item, response=response, file_contents=file_contents,
-        trajectory=trajectory, judge_model=judge_model,
-        judge_api_key=judge_api_key, judge_base_url=judge_base_url,
+        item=item,
+        response=response,
+        file_contents=file_contents,
+        trajectory=trajectory,
+        judge_model=judge_model,
+        judge_api_key=judge_api_key,
+        judge_base_url=judge_base_url,
         aws_region_name=aws_region_name,
         input_image_paths=input_image_paths,
         output_media_paths=output_media_paths,
         judge_canonical_name=judge_canonical_name,
         task_key=task_key,
     )
-    first = _score_llm_judge_single(**kwargs)
+    first = _score_llm_judge_single(**kwargs)  # pyright: ignore[reportArgumentType]
     if not enable_voting or _is_refused(first):
         return first
     # Two independent suspicion triggers:
@@ -1157,9 +1201,10 @@ def score_llm_judge(
         return first
     logger.warning(
         "Judge rubric #%d flagged as suspicious (%s); re-running for N-of-3 majority vote",
-        item.number, reason,
+        item.number,
+        reason,
     )
-    extras = [_score_llm_judge_single(**kwargs) for _ in range(2)]
+    extras = [_score_llm_judge_single(**kwargs) for _ in range(2)]  # pyright: ignore[reportArgumentType]
     all_results = [first] + extras
     majority = _majority_passed(all_results)
     representative = next(r for r in all_results if r.passed == majority)
@@ -1269,8 +1314,11 @@ def score_llm_judge_council(
             if enable_per_judge_voting:
                 # Each judge does its own retry-on-suspicion voting.
                 result = score_llm_judge(
-                    item=item, response=response, file_contents=file_contents,
-                    trajectory=trajectory, judge_model=model,
+                    item=item,
+                    response=response,
+                    file_contents=file_contents,
+                    trajectory=trajectory,
+                    judge_model=model,
                     judge_api_key=api_keys[idx],
                     judge_base_url=base_urls[idx],
                     aws_region_name=regions[idx],
@@ -1282,8 +1330,11 @@ def score_llm_judge_council(
                 )
             else:
                 result = _score_llm_judge_single(
-                    item=item, response=response, file_contents=file_contents,
-                    trajectory=trajectory, judge_model=model,
+                    item=item,
+                    response=response,
+                    file_contents=file_contents,
+                    trajectory=trajectory,
+                    judge_model=model,
                     judge_api_key=api_keys[idx],
                     judge_base_url=base_urls[idx],
                     aws_region_name=regions[idx],
@@ -1302,7 +1353,9 @@ def score_llm_judge_council(
         except Exception as e:
             logger.warning(
                 "Council judge %s failed on item #%d: %s",
-                model, item.number, e,
+                model,
+                item.number,
+                e,
             )
             return JudgeVerdict(
                 judge_model=model,

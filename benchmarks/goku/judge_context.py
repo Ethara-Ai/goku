@@ -12,11 +12,22 @@ from __future__ import annotations
 from pathlib import Path
 
 
-MEDIA_SUFFIXES = frozenset({
-    ".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp",
-    ".pdf",
-    ".mp4", ".mov", ".webm", ".avi", ".mkv",
-})
+MEDIA_SUFFIXES = frozenset(
+    {
+        ".png",
+        ".jpg",
+        ".jpeg",
+        ".gif",
+        ".webp",
+        ".bmp",
+        ".pdf",
+        ".mp4",
+        ".mov",
+        ".webm",
+        ".avi",
+        ".mkv",
+    }
+)
 
 TEXT_PREVIEW_BYTES = 50_000
 TEXT_HARD_CAP_BYTES = 500_000
@@ -54,6 +65,8 @@ def collect_file_contents(
 
     for f in sorted(results_dir.rglob("*")):
         if not f.is_file():
+            continue
+        if f.name in (".DS_Store", "Thumbs.db", ".gitkeep"):
             continue
         if exclude:
             try:

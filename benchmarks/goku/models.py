@@ -45,8 +45,10 @@ class RubricItem(BaseModel):
     criterion: str = Field(..., min_length=1)
 
     # Type-specific optional fields
-    paths: list[str] | None = None  # probe_file_exists, probe_dir_exists
-    path: str | None = None  # probe_file_contains
+    paths: list[str] | None = None  # probe_file_exists, probe_dir_exists (preferred)
+    path: str | None = (
+        None  # probe_file_contains; also accepted by probe_file_exists/probe_dir_exists
+    )
     pattern: str | None = None  # probe_file_contains, response_regex_present
     ignore_case: bool = False  # probe_file_contains
     raw_shell: str | None = None  # shell_succeeds_real
@@ -80,6 +82,15 @@ class ScorerResult(BaseModel):
     # response_not_criteria items. In council mode this is the SUM across
     # all judges that contributed.
     judge_cost_usd: float = Field(default=0.0, ge=0.0)
+
+    # Populated when the judge call itself failed (timeout / API error / retries
+    # exhausted) or its output could not be parsed. The verdict still falls back
+    # to a conservative `passed=False` (aggregation is unchanged), but this flag
+    # lets operators and `rescore` DISTINGUISH an infrastructure failure from a
+    # genuine "criterion not met" and re-judge rather than trust a forced zero.
+    # None on every healthy verdict, so existing scores.jsonl consumers are
+    # unaffected.
+    error: str | None = None
 
     # Council-mode fields (None for single-judge runs — preserves backward
     # compatibility with the existing scores.jsonl schema). Populated only
@@ -166,9 +177,10 @@ class BenchmarkReport(BaseModel):
     total_cache_write_tokens: int = Field(default=0, ge=0)
     mean_cost_per_run_usd: float = Field(default=0.0, ge=0.0)
     total_runs_with_metrics: int = Field(
-        default=0, ge=0,
+        default=0,
+        ge=0,
         description="How many (task, run) outputs contributed cost data — "
-                    "useful to spot missing metrics when this is < total_tasks * n_runs."
+        "useful to spot missing metrics when this is < total_tasks * n_runs.",
     )
     # Judge LLM cost, summed across every (task, run) for this model.
     # 0 for older scores.jsonl files (judge cost only tracked from this
@@ -185,7 +197,9 @@ class BenchmarkReport(BaseModel):
         ),
     )
     mean_non_format_score: float = Field(
-        default=0.0, ge=0.0, le=1.0,
+        default=0.0,
+        ge=0.0,
+        le=1.0,
         description="Mean per_task_score across all non-FORMAT rubric items.",
     )
     tab3_difficulty_target_hit: bool = Field(

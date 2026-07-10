@@ -596,6 +596,8 @@ def collect_file_contents(output_dir: Path) -> str:
     for f in sorted(output_dir.rglob("*")):
         if not f.is_file():
             continue
+        if f.name in (".DS_Store", "Thumbs.db", ".gitkeep"):
+            continue
         if files_read >= _CONTENT_MAX_FILES or total_bytes >= _CONTENT_MAX_BYTES:
             contents.append("(remaining files truncated — limit reached)")
             break

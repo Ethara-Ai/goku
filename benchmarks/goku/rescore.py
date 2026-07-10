@@ -64,6 +64,7 @@ logger = logging.getLogger(__name__)
 # Helpers — extract agent context from saved output.jsonl
 # ─────────────────────────────────────────────────────────────────────────────
 
+
 def extract_response_from_history(history: list) -> str:
     """Walk the saved history list (latest-first) for the final agent text.
 
@@ -124,6 +125,7 @@ def collect_file_contents(results_dir: Path) -> tuple[str, list[str]]:
     """Re-judge path: like run_infer's collector but excludes ``bash_events/``
     since those are debugging traces, not agent artifacts."""
     from benchmarks.goku.judge_context import collect_file_contents as _impl
+
     return _impl(results_dir, exclude_top_dirs={"bash_events"})
 
 
@@ -184,14 +186,16 @@ def update_output_jsonl_test_result(
             tr = {}
         # Preserve unrelated test_result keys; only overwrite the aggregates
         # rescore.py freshly computes. Round to match write_scores_jsonl.
-        tr.update({
-            "awarded": task_score.awarded,
-            "max_total": task_score.max_total,
-            "raw_score": round(task_score.raw_score, 4),
-            "per_task_score": round(task_score.per_task_score, 4),
-            "passed": task_score.passed,
-            "judge_cost_usd": round(task_score.judge_cost_usd, 6),
-        })
+        tr.update(
+            {
+                "awarded": task_score.awarded,
+                "max_total": task_score.max_total,
+                "raw_score": round(task_score.raw_score, 4),
+                "per_task_score": round(task_score.per_task_score, 4),
+                "passed": task_score.passed,
+                "judge_cost_usd": round(task_score.judge_cost_usd, 6),
+            }
+        )
         d["test_result"] = tr
         new_lines.append(json.dumps(d, ensure_ascii=False))
         updated = True
@@ -203,6 +207,7 @@ def update_output_jsonl_test_result(
     # rename is atomic on POSIX, so concurrent readers see either the old
     # file or the new one, never a partial.
     import tempfile
+
     fd, tmp_path = tempfile.mkstemp(
         dir=str(output_jsonl.parent),
         prefix=f".{output_jsonl.name}.tmp.",
@@ -225,6 +230,7 @@ def update_output_jsonl_test_result(
 # ─────────────────────────────────────────────────────────────────────────────
 # Core: rescore a single (task, model, run)
 # ─────────────────────────────────────────────────────────────────────────────
+
 
 def rescore_single(
     *,
@@ -287,61 +293,82 @@ def rescore_single(
                     or "[Judge not configured" in prev_rationale
                 )
                 if prev is not None and not is_placeholder:
-                    # Preserve the existing verdict — convert dict → ScorerResult
-                    results.append(ScorerResult(
-                        number=item.number,
-                        passed=bool(prev.get("passed", False)),
-                        judge_rationale=prev_rationale,
-                        points_awarded=int(
-                            prev.get("points_awarded")
-                            if prev.get("points_awarded") is not None
-                            else (item.points if prev.get("passed") else 0)
-                        ),
-                    ))
+                    # Preserve the existing verdict — convert dict → ScorerResult.
+                    # scores.jsonl stores the DISPLAY value of 'passed', which
+                    # write_scores_jsonl INVERTS for negative (points < 0) rubric
+                    # items (display: passed=False == hallucination detected).
+                    # compute_task_score expects INTERNAL semantics (passed=True ==
+                    # criterion matched), so re-invert negatives here — otherwise a
+                    # detected hallucination is silently dropped on a --skip-llm-judge
+                    # rescore and the task score is inflated.
+                    stored_passed = bool(prev.get("passed", False))
+                    internal_passed = (
+                        (not stored_passed) if item.points < 0 else stored_passed
+                    )
+                    prev_points = prev.get("points_awarded")
+                    points_awarded = (
+                        int(prev_points)
+                        if prev_points is not None
+                        else (item.points if internal_passed else 0)
+                    )
+                    results.append(
+                        ScorerResult(
+                            number=item.number,
+                            passed=internal_passed,
+                            judge_rationale=prev_rationale,
+                            points_awarded=points_awarded,
+                        )
+                    )
                     continue
                 # Otherwise stub out the rubric so structure is intact.
-                results.append(ScorerResult(
-                    number=item.number,
-                    passed=False,
-                    judge_rationale="(skipped — --skip-llm-judge)",
-                    points_awarded=0,
-                ))
+                results.append(
+                    ScorerResult(
+                        number=item.number,
+                        passed=False,
+                        judge_rationale="(skipped — --skip-llm-judge)",
+                        points_awarded=0,
+                    )
+                )
             elif judge_council_models:
                 # Council mode — multi-judge majority vote.
-                results.append(score_llm_judge_council(
-                    item=item,
-                    response=response_text,
-                    file_contents=file_contents,
-                    trajectory=trajectory,
-                    judge_models=judge_council_models,
-                    judge_api_keys=judge_council_api_keys,
-                    aws_region_names=judge_council_regions,
-                    input_image_paths=input_image_paths or [],
-                    output_media_paths=output_media_paths or [],
-                    task_key=task_dir.name,
-                    # Defense against confabulation/inconsistency at the
-                    # individual-judge level. Conditional retry — only
-                    # fires when the judge's response trips suspicion
-                    # checks (cited fake filename or rationale/boolean
-                    # mismatch). Clean responses pay zero extra cost.
-                    enable_per_judge_voting=True,
-                ))
+                results.append(
+                    score_llm_judge_council(
+                        item=item,
+                        response=response_text,
+                        file_contents=file_contents,
+                        trajectory=trajectory,
+                        judge_models=judge_council_models,
+                        judge_api_keys=judge_council_api_keys,
+                        aws_region_names=judge_council_regions,
+                        input_image_paths=input_image_paths or [],
+                        output_media_paths=output_media_paths or [],
+                        task_key=task_dir.name,
+                        # Defense against confabulation/inconsistency at the
+                        # individual-judge level. Conditional retry — only
+                        # fires when the judge's response trips suspicion
+                        # checks (cited fake filename or rationale/boolean
+                        # mismatch). Clean responses pay zero extra cost.
+                        enable_per_judge_voting=True,
+                    )
+                )
             else:
-                results.append(score_llm_judge(
-                    item=item,
-                    response=response_text,
-                    file_contents=file_contents,
-                    trajectory=trajectory,
-                    judge_model=judge_model,
-                    judge_api_key=judge_api_key,
-                    aws_region_name=judge_region,
-                    input_image_paths=input_image_paths or [],
-                    output_media_paths=output_media_paths or [],
-                    # task_dir.name is the task_xxx hash (e.g. task_abc...).
-                    # Used by the judge's many-image S3-URL short-circuit
-                    # so all rubric calls reuse one upload via cache.
-                    task_key=task_dir.name,
-                ))
+                results.append(
+                    score_llm_judge(
+                        item=item,
+                        response=response_text,
+                        file_contents=file_contents,
+                        trajectory=trajectory,
+                        judge_model=judge_model,
+                        judge_api_key=judge_api_key,
+                        aws_region_name=judge_region,
+                        input_image_paths=input_image_paths or [],
+                        output_media_paths=output_media_paths or [],
+                        # task_dir.name is the task_xxx hash (e.g. task_abc...).
+                        # Used by the judge's many-image S3-URL short-circuit
+                        # so all rubric calls reuse one upload via cache.
+                        task_key=task_dir.name,
+                    )
+                )
         else:
             raise ValueError(
                 f"Unknown rubric type: {item.type} for item #{item.number}"
@@ -352,6 +379,7 @@ def rescore_single(
 # ─────────────────────────────────────────────────────────────────────────────
 # Discovery + driver
 # ─────────────────────────────────────────────────────────────────────────────
+
 
 def discover_targets(
     output_base: Path,
@@ -371,6 +399,7 @@ def discover_targets(
     # `_archive_` substring missed the actual `.archive_pre_rerun_`
     # naming used by clean_resume_state.py.
     from benchmarks.goku.eval_infer import _is_archive_path
+
     for scores_file in sorted(output_base.rglob("scores.jsonl")):
         if _is_archive_path(scores_file):
             continue
@@ -397,6 +426,7 @@ def main() -> None:
     # which already builds the correct per-provider PDF block shape
     # without going through the SDK DocumentContent class.
     from benchmarks.utils import httpx_patches
+
     httpx_patches.apply()
 
     logging.basicConfig(
@@ -412,19 +442,23 @@ def main() -> None:
         )
     )
     parser.add_argument(
-        "--output-dir", required=True,
+        "--output-dir",
+        required=True,
         help="Path to eval_outputs/ (or whatever your --output-dir was).",
     )
     parser.add_argument(
-        "--tasks-dir", required=True,
+        "--tasks-dir",
+        required=True,
         help="Path to dataset/ — current rubrics are loaded from here.",
     )
     parser.add_argument(
-        "--tasks", default=None,
+        "--tasks",
+        default=None,
         help="Comma-separated task keys (default: rescore all tasks found).",
     )
     parser.add_argument(
-        "--models", default=None,
+        "--models",
+        default=None,
         help=(
             "Comma-separated EXACT model dir names to rescore "
             "(default: all). Use the full slug (e.g. "
@@ -432,7 +466,8 @@ def main() -> None:
         ),
     )
     parser.add_argument(
-        "--judge-llm-config", default=None,
+        "--judge-llm-config",
+        default=None,
         help=(
             "Path to LLM config JSON for the judge model. Falls back to "
             "GOKU_JUDGE_MODEL / AWS_BEARER_TOKEN_BEDROCK / AWS_REGION_NAME "
@@ -440,7 +475,8 @@ def main() -> None:
         ),
     )
     parser.add_argument(
-        "--judge-llm-configs", default=None,
+        "--judge-llm-configs",
+        default=None,
         help=(
             "Comma-separated paths to LLM config JSONs for a judge COUNCIL "
             "(e.g., .llm_config/claude-sonnet-4.6.json,.llm_config/gpt-5.json,"
@@ -451,14 +487,16 @@ def main() -> None:
         ),
     )
     parser.add_argument(
-        "--backup", action="store_true",
+        "--backup",
+        action="store_true",
         help=(
             "Before overwriting scores.jsonl, copy it to "
             "scores.before-rescore.jsonl (skipped if backup already exists)."
         ),
     )
     parser.add_argument(
-        "--skip-llm-judge", action="store_true",
+        "--skip-llm-judge",
+        action="store_true",
         help=(
             "Skip LLM-judged rubric items (response_criteria / "
             "response_not_criteria). Deterministic items still rescored. "
@@ -466,18 +504,22 @@ def main() -> None:
         ),
     )
     parser.add_argument(
-        "--export-delivery", default=None,
+        "--export-delivery",
+        default=None,
         help=(
             "After rescoring, export the delivery folder structure to this "
             "path (e.g. delivery/). Skipped if omitted."
         ),
     )
     parser.add_argument(
-        "--dry-run", action="store_true",
+        "--dry-run",
+        action="store_true",
         help="List what would be rescored, then exit without modifying anything.",
     )
     parser.add_argument(
-        "--num-workers", type=int, default=1,
+        "--num-workers",
+        type=int,
+        default=1,
         help=(
             "Number of (task, model) pairs to rescore concurrently. Each "
             "worker processes one pair end-to-end (rubric items still run "
@@ -487,7 +529,8 @@ def main() -> None:
         ),
     )
     parser.add_argument(
-        "--export-only", action="store_true",
+        "--export-only",
+        action="store_true",
         help=(
             "Skip all scoring and only run the delivery-export step. Read-only "
             "against existing scores.jsonl files — no judge calls, no API cost, "
@@ -504,12 +547,12 @@ def main() -> None:
 
     # ---- 1. Resolve filters ----
     task_filter = (
-        {t.strip() for t in args.tasks.split(",") if t.strip()}
-        if args.tasks else None
+        {t.strip() for t in args.tasks.split(",") if t.strip()} if args.tasks else None
     )
     model_filter = (
         [m.strip() for m in args.models.split(",") if m.strip()]
-        if args.models else None
+        if args.models
+        else None
     )
 
     # ---- 2. Resolve judge config (skipped in --export-only) ----
@@ -556,9 +599,7 @@ def main() -> None:
             judge_api_key = _resolve_key(judge_llm)
             judge_region = getattr(judge_llm, "aws_region_name", None)
         else:
-            judge_model = os.getenv(
-                "GOKU_JUDGE_MODEL", "gemini/gemini-3.5-flash"
-            )
+            judge_model = os.getenv("GOKU_JUDGE_MODEL", "gemini/gemini-3.5-flash")
             judge_api_key = os.getenv("AWS_BEARER_TOKEN_BEDROCK")
             judge_region = os.getenv("AWS_REGION_NAME")
 
@@ -570,7 +611,8 @@ def main() -> None:
     )
     logger.info(
         "Found %d (task, model, run) tuples to rescore in %s",
-        len(targets), output_base,
+        len(targets),
+        output_base,
     )
 
     if args.dry_run:
@@ -598,7 +640,9 @@ def main() -> None:
         for task_key in unique_task_keys:
             task_path = tasks_dir / task_key
             if not task_path.is_dir():
-                logger.warning("Task %s not found in %s — skipping", task_key, tasks_dir)
+                logger.warning(
+                    "Task %s not found in %s — skipping", task_key, tasks_dir
+                )
                 task_cache[task_key] = None
                 continue
             try:
@@ -660,7 +704,8 @@ def main() -> None:
                     logger.info(
                         "Recovered %s entry from %s (live output.jsonl no longer "
                         "has it — likely stripped by prior --rerun)",
-                        task_key, ever_seen_jsonl.name,
+                        task_key,
+                        ever_seen_jsonl.name,
                     )
 
             if agent_data is None:
@@ -669,7 +714,8 @@ def main() -> None:
                     both += f" or {ever_seen_jsonl.name}"
                 logger.warning(
                     "No entry for %s in %s — skipping",
-                    task_key, both,
+                    task_key,
+                    both,
                 )
                 return "skip"
 
@@ -727,18 +773,24 @@ def main() -> None:
             # tasks of the same model would race on the read-modify-write).
             with _lock_for(model_output_jsonl):
                 if not update_output_jsonl_test_result(
-                    model_output_jsonl, task_key, task_score,
+                    model_output_jsonl,
+                    task_key,
+                    task_score,
                 ):
                     logger.warning(
                         "Updated %s but could not propagate to %s — benchmark "
                         "report may show stale aggregates for this instance.",
-                        scores_file, model_output_jsonl,
+                        scores_file,
+                        model_output_jsonl,
                     )
             logger.info(
                 "Rescored %s in %s: passed=%s, per_task_score=%.4f, awarded=%d/%d",
-                task_key, scores_file.parent.parent.name[:30],
-                task_score.passed, task_score.per_task_score,
-                task_score.awarded, task_score.max_total,
+                task_key,
+                scores_file.parent.parent.name[:30],
+                task_score.passed,
+                task_score.per_task_score,
+                task_score.awarded,
+                task_score.max_total,
             )
             return "ok"
 
@@ -751,17 +803,24 @@ def main() -> None:
         if args.num_workers == 1:
             for task_key, scores_file in targets:
                 outcome = _process_target(task_key, scores_file)
-                if outcome == "ok": n_ok += 1
-                elif outcome == "skip": n_skip += 1
-                else: n_fail += 1
+                if outcome == "ok":
+                    n_ok += 1
+                elif outcome == "skip":
+                    n_skip += 1
+                else:
+                    n_fail += 1
         else:
             logger.info(
                 "Parallel rescore: dispatching %d (task, model) pairs across %d workers",
-                len(targets), args.num_workers,
+                len(targets),
+                args.num_workers,
             )
             with ThreadPoolExecutor(max_workers=args.num_workers) as pool:
                 futures = {
-                    pool.submit(_process_target, task_key, scores_file): (task_key, scores_file)
+                    pool.submit(_process_target, task_key, scores_file): (
+                        task_key,
+                        scores_file,
+                    )
                     for task_key, scores_file in targets
                 }
                 for fut in as_completed(futures):
@@ -770,14 +829,21 @@ def main() -> None:
                         outcome = fut.result()
                     except Exception:
                         logger.exception(
-                            "Worker raised for %s in %s", task_key, scores_file,
+                            "Worker raised for %s in %s",
+                            task_key,
+                            scores_file,
                         )
                         outcome = "fail"
-                    if outcome == "ok": n_ok += 1
-                    elif outcome == "skip": n_skip += 1
-                    else: n_fail += 1
+                    if outcome == "ok":
+                        n_ok += 1
+                    elif outcome == "skip":
+                        n_skip += 1
+                    else:
+                        n_fail += 1
 
-        logger.info("Rescore complete: %d ok, %d skipped, %d failed", n_ok, n_skip, n_fail)
+        logger.info(
+            "Rescore complete: %d ok, %d skipped, %d failed", n_ok, n_skip, n_fail
+        )
 
     # ---- 5. Optionally re-export delivery ----
     if args.export_delivery:
@@ -794,9 +860,7 @@ def main() -> None:
         if model_filter:
             export_models = model_filter
         else:
-            export_models = sorted({
-                t[1].parent.parent.name for t in targets
-            })
+            export_models = sorted({t[1].parent.parent.name for t in targets})
         export_delivery_format(
             output_base_dir=output_base,
             tasks_source_dir=tasks_dir,

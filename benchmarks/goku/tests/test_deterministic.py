@@ -53,6 +53,32 @@ class TestProbeFileExists:
         result = score_deterministic(item, tmp_path, "")
         assert result.passed is False
 
+    def test_file_exists_singular_path(self, tmp_path: Path):
+        # Parity with probe_file_contains: the singular `path` field is accepted.
+        (tmp_path / "output.json").write_text('{"data": 1}')
+        item = _make_item(type="probe_file_exists", paths=None, path="output.json")
+        result = score_deterministic(item, tmp_path, "")
+        assert result.passed is True
+
+    def test_file_singular_path_missing(self, tmp_path: Path):
+        item = _make_item(type="probe_file_exists", paths=None, path="output.json")
+        result = score_deterministic(item, tmp_path, "")
+        assert result.passed is False
+
+    def test_paths_wins_over_singular_path(self, tmp_path: Path):
+        # When both are set, `paths` takes precedence (back-compat with all data).
+        (tmp_path / "a.json").write_text("{}")
+        item = _make_item(
+            type="probe_file_exists", paths=["a.json"], path="ignored_missing.json"
+        )
+        result = score_deterministic(item, tmp_path, "")
+        assert result.passed is True
+
+    def test_neither_paths_nor_path(self, tmp_path: Path):
+        item = _make_item(type="probe_file_exists", paths=None, path=None)
+        result = score_deterministic(item, tmp_path, "")
+        assert result.passed is False
+
 
 class TestProbeFileContains:
     def test_pattern_found(self, tmp_path: Path):
@@ -116,6 +142,24 @@ class TestProbeDirExists:
 
     def test_dir_missing(self, tmp_path: Path):
         item = _make_item(type="probe_dir_exists", paths=["images"])
+        result = score_deterministic(item, tmp_path, "")
+        assert result.passed is False
+
+    def test_dir_exists_singular_path(self, tmp_path: Path):
+        # The bug this fixes: a probe_dir_exists using singular `path` used to
+        # score False ("No paths specified") regardless of the directory.
+        (tmp_path / "images").mkdir()
+        item = _make_item(type="probe_dir_exists", paths=None, path="images")
+        result = score_deterministic(item, tmp_path, "")
+        assert result.passed is True
+
+    def test_dir_singular_path_missing(self, tmp_path: Path):
+        item = _make_item(type="probe_dir_exists", paths=None, path="images")
+        result = score_deterministic(item, tmp_path, "")
+        assert result.passed is False
+
+    def test_dir_neither_paths_nor_path(self, tmp_path: Path):
+        item = _make_item(type="probe_dir_exists", paths=None, path=None)
         result = score_deterministic(item, tmp_path, "")
         assert result.passed is False
 

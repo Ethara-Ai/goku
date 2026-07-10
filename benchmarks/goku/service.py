@@ -751,10 +751,17 @@ def _persist_run_outputs(
             logger.warning("skipping persist of output_file %r: %s", fname, e)
 
     _SKIP_DIRS = frozenset({"bash_events", ".git"})
+    # OS filesystem junk that agents never intend as output. Deliberately does
+    # NOT include ".gitkeep": that file is often the sole occupant of an
+    # otherwise-empty directory, and dropping it would stop that directory from
+    # being reproduced under results_dir — which would break probe_dir_exists.
+    _SKIP_NAMES = frozenset({".DS_Store", "Thumbs.db"})
 
     if agent_workspace is not None and agent_workspace.exists():
         for src in agent_workspace.rglob("*"):
             if not src.is_file():
+                continue
+            if src.name in _SKIP_NAMES:
                 continue
             rel = src.relative_to(agent_workspace)
             if rel.parts and rel.parts[0] in _SKIP_DIRS:

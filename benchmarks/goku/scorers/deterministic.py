@@ -88,20 +88,37 @@ def score_deterministic(
     )
 
 
+def _resolve_paths(item: RubricItem) -> list[str]:
+    """Resolve the target path list for a path-based probe.
+
+    Accepts the plural ``paths`` (doc spec, used by all current data) or the
+    singular ``path`` (parity with probe_file_contains, which already accepts
+    both). ``paths`` wins when both are set. Returns ``[]`` when neither is
+    provided so callers keep their existing graceful "No paths specified"
+    failure rather than raising or vacuously passing.
+    """
+    if item.paths:
+        return list(item.paths)
+    if item.path:
+        return [item.path]
+    return []
+
+
 def _score_probe_file_exists(
     item: RubricItem, output_dir: Path, _response: str
 ) -> tuple[bool, str]:
-    """Check that all files in item.paths exist under output_dir.
+    """Check that all files in item.paths (or item.path) exist under output_dir.
 
     Searches recursively — paths are bare filenames per doc spec, so they
     may be in subdirectories (e.g. avatars/option-1.webp).
     """
-    if not item.paths:
+    paths = _resolve_paths(item)
+    if not paths:
         return False, "No paths specified in rubric item"
 
     missing: list[str] = []
     found: list[str] = []
-    for p in item.paths:
+    for p in paths:
         full_path = output_dir / p
         if (
             full_path.exists()
@@ -290,13 +307,14 @@ def _score_probe_file_contains(
 def _score_probe_dir_exists(
     item: RubricItem, output_dir: Path, _response: str
 ) -> tuple[bool, str]:
-    """Check that all directories in item.paths exist under output_dir."""
-    if not item.paths:
+    """Check that all directories in item.paths (or item.path) exist under output_dir."""
+    paths = _resolve_paths(item)
+    if not paths:
         return False, "No paths specified in rubric item"
 
     missing: list[str] = []
     found: list[str] = []
-    for p in item.paths:
+    for p in paths:
         full_path = output_dir / p
         if (
             full_path.exists()
