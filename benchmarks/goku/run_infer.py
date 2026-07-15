@@ -18,7 +18,7 @@ import shutil
 import tempfile
 import time
 from pathlib import Path
-from typing import List, Sequence
+from typing import Any, List, Sequence
 
 from dotenv import load_dotenv
 
@@ -544,6 +544,15 @@ class GokuEvaluation(Evaluation):
         instruction: str = instance.data["instruction"]
         input_files: list[str] = instance.data.get("input_files", [])
 
+        # Agent-backend switch. "claudecode" drives trajectory generation with
+        # the Claude Code CLI (subscription OAuth via the host bridge) instead
+        # of the OpenHands SDK agent; the scoring tail is shared.
+        backend = (self.metadata.details or {}).get("agent_backend", "openhands")
+        if backend == "claudecode":
+            return self._evaluate_instance_claudecode(
+                instance, workspace, instruction, input_files
+            )
+
         # Build per-media-type content blocks for the initial multimodal turn.
         #   * Images → existing ImageContent path (provider-universal).
         #   * PDFs   → DocumentContent (native per-provider block — SDK extended
@@ -780,7 +789,39 @@ class GokuEvaluation(Evaluation):
         # Collect trajectory for LLM judge context
         trajectory = self._format_trajectory(events)
 
-        # Score all rubric items
+        # Score rubrics, persist scores.jsonl + results/, and build the
+        # EvalOutput. Both agent backends (OpenHands SDK, Claude Code) share
+        # this tail; only response/trajectory/history/metrics differ upstream.
+        task_score, rubric_items = self._score_rubrics(
+            instance=instance,
+            response_text=response_text,
+            output_dir=output_dir,
+            file_contents=file_contents,
+            output_media_paths=output_media_paths,
+            trajectory=trajectory,
+        )
+        return self._persist_and_build_output(
+            instance=instance,
+            instruction=instruction,
+            task_score=task_score,
+            rubric_items=rubric_items,
+            output_dir=output_dir,
+            history=list(events),
+            metrics=conversation.conversation_stats.get_combined_metrics(),  # type: ignore[attr-defined]
+        )
+
+    def _score_rubrics(
+        self,
+        *,
+        instance: EvalInstance,
+        response_text: str,
+        output_dir: Path,
+        file_contents: str,
+        output_media_paths: list[str],
+        trajectory: str,
+    ) -> tuple[Any, List[RubricItem]]:
+        """Score every rubric item (deterministic + LLM-judge/council) and
+        return ``(task_score, rubric_items)``. Backend-agnostic."""
         rubric_items = [
             RubricItem(**item_data) for item_data in instance.data["rubric_items"]
         ]
@@ -886,7 +927,22 @@ class GokuEvaluation(Evaluation):
 
         # Compute task score
         task_score = compute_task_score(results, rubric_items)
+        return task_score, rubric_items
 
+    def _persist_and_build_output(
+        self,
+        *,
+        instance: EvalInstance,
+        instruction: str,
+        task_score: Any,
+        rubric_items: List[RubricItem],
+        output_dir: Path,
+        history: list,
+        metrics: Any,
+    ) -> EvalOutput:
+        """Persist scores.jsonl + results/, clean up the download tempdir, and
+        build the EvalOutput. Backend-agnostic (history/metrics are supplied by
+        the caller — OpenHands events+stats, or empty for Claude Code)."""
         # Persist results to eval output dir
         eval_task_dir = Path(self.metadata.eval_output_dir) / instance.id
         eval_task_dir.mkdir(parents=True, exist_ok=True)
@@ -929,8 +985,159 @@ class GokuEvaluation(Evaluation):
             },
             instruction=instruction,
             error=None,
-            history=list(events),
-            metrics=conversation.conversation_stats.get_combined_metrics(),  # type: ignore[attr-defined]
+            history=history,
+            metrics=metrics,
+            instance=instance.data,
+        )
+
+    def _evaluate_instance_claudecode(
+        self,
+        instance: EvalInstance,
+        workspace: RemoteWorkspace,
+        instruction: str,
+        input_files: list[str],
+    ) -> EvalOutput:
+        """Run one task with the Claude Code CLI backend and score it.
+
+        The workspace (from prepare_workspace) already holds the task's input
+        media under /workspace; the CLI reads them from disk. We run the CLI
+        in-container against the subscription OAuth bridge, then feed the
+        response/trajectory/outputs into goku's shared scoring path.
+        """
+        from benchmarks.goku.claudecode_runner import run_claudecode_task
+
+        details = self.metadata.details or {}
+        bridge_url = details.get("cc_bridge_url") or os.environ.get("GOKU_CC_BRIDGE_URL")
+        bridge_api_key = details.get("cc_bridge_api_key") or os.environ.get(
+            "GOKU_CC_BRIDGE_SECRET", ""
+        )
+        model = details.get("cc_model") or os.environ.get("GOKU_CC_MODEL", "opus")
+        if not bridge_url:
+            raise RuntimeError(
+                "claudecode backend selected but no OAuth bridge URL is "
+                "configured (cc_bridge_url / GOKU_CC_BRIDGE_URL). The bridge is "
+                "started by run_infer.main() when --agent-backend claudecode is "
+                "passed."
+            )
+
+        input_file_names = [
+            os.path.basename(f) for f in input_files if os.path.exists(f)
+        ]
+
+        # Wall-clock cap for the CLI run; --max-turns bounds it independently.
+        timeout_seconds = int(
+            details.get("cc_timeout_seconds")
+            or os.environ.get("GOKU_CC_TIMEOUT", "1800")
+        )
+
+        cc = run_claudecode_task(
+            workspace=workspace,
+            instruction=instruction,
+            input_file_names=input_file_names,
+            instance_id=instance.id,
+            model=model,
+            bridge_url=bridge_url,
+            bridge_api_key=bridge_api_key,
+            max_turns=self.metadata.max_iterations,
+            timeout_seconds=timeout_seconds,
+        )
+
+        # Download output files (shared, backend-agnostic path).
+        output_dir = self._download_outputs(workspace, instance.id, input_file_names)
+        file_contents, output_media_paths = self._collect_file_contents(output_dir)
+
+        # Persist the trajectory + agent artifacts BEFORE scoring. Trajectory
+        # generation is the Claude Code backend's whole purpose, so it must not
+        # be lost to a downstream scoring failure (e.g. no judge credentials, or
+        # the judge's many-image S3 requirement). EvalOutput.history/metrics stay
+        # empty because they are typed for OpenHands events; CC usage lands in
+        # test_result.
+        eval_task_dir = Path(self.metadata.eval_output_dir) / instance.id
+        eval_task_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            import json as _json
+
+            (eval_task_dir / "claude_code_trajectory.jsonl").write_text(
+                "\n".join(_json.dumps(e) for e in cc.raw_events),
+                encoding="utf-8",
+            )
+        except Exception as exc:
+            logger.warning("Could not persist Claude Code trajectory: %s", exc)
+
+        # Copy agent output files (auto_result/, etc.) into results/ now.
+        eval_results_dir = eval_task_dir / "results"
+        if eval_results_dir.exists():
+            shutil.rmtree(eval_results_dir)
+        shutil.copytree(output_dir, eval_results_dir, dirs_exist_ok=True)
+
+        cc_usage = {
+            "cc_input_tokens": (cc.metrics or {}).get("input_tokens"),
+            "cc_output_tokens": (cc.metrics or {}).get("output_tokens"),
+            "cc_cache_read_tokens": (cc.metrics or {}).get("cache_read_tokens"),
+            "cc_cache_write_tokens": (cc.metrics or {}).get("cache_write_tokens"),
+            "cc_cost_usd": (cc.metrics or {}).get("cost_usd"),
+            "cc_num_turns": (cc.metrics or {}).get("num_turns"),
+        }
+
+        # Best-effort scoring. A judge/credential failure must neither discard
+        # the persisted trajectory + outputs nor trigger an expensive agent
+        # re-run — so we catch, record the error, and return a completed output.
+        try:
+            task_score, rubric_items = self._score_rubrics(
+                instance=instance,
+                response_text=cc.response_text,
+                output_dir=output_dir,
+                file_contents=file_contents,
+                output_media_paths=output_media_paths,
+                trajectory=cc.trajectory,
+            )
+        except Exception as exc:
+            logger.error(
+                "Scoring failed for %s; trajectory + outputs are preserved at "
+                "%s. Error: %s",
+                instance.id,
+                eval_task_dir,
+                exc,
+            )
+            shutil.rmtree(output_dir, ignore_errors=True)
+            return EvalOutput(
+                instance_id=instance.id,
+                attempt=self.current_attempt,
+                test_result={"per_task_score": 0.0, "scoring_error": str(exc), **cc_usage},
+                instruction=instruction,
+                error=f"scoring_failed: {exc}",
+                history=[],
+                metrics=None,
+                instance=instance.data,
+            )
+
+        # Write scores.jsonl and clean up the download tempdir (results/ already
+        # copied above).
+        write_scores_jsonl(
+            task_score, eval_task_dir / "scores.jsonl", rubric_items=rubric_items
+        )
+        shutil.rmtree(output_dir, ignore_errors=True)
+        logger.info(
+            f"Instance {instance.id}: per_task_score={task_score.per_task_score:.4f}, "
+            f"passed={task_score.passed}, "
+            f"awarded={task_score.awarded}/{task_score.max_total}"
+        )
+        return EvalOutput(
+            instance_id=instance.id,
+            attempt=self.current_attempt,
+            test_result={
+                "per_task_score": task_score.per_task_score,
+                "raw_score": task_score.raw_score,
+                "passed": task_score.passed,
+                "awarded": task_score.awarded,
+                "max_total": task_score.max_total,
+                "judge_cost_usd": task_score.judge_cost_usd,
+                **cc_usage,
+            },
+            instruction=instruction,
+            error=None,
+            history=[],
+            metrics=None,
             instance=instance.data,
         )
 
@@ -1213,6 +1420,44 @@ def main() -> None:
         help="Path to LLM config JSON for the judge model (e.g., .llm_config/gemini-3.5-flash.json)",
     )
     parser.add_argument(
+        "--agent-backend",
+        type=str,
+        default="openhands",
+        choices=["openhands", "claudecode"],
+        help=(
+            "Agent used for trajectory generation. 'openhands' (default) uses "
+            "the OpenHands SDK agent over LiteLLM/Bedrock. 'claudecode' drives "
+            "the Claude Code CLI inside the workspace container, billed against "
+            "the host's Claude Code subscription via the OAuth bridge."
+        ),
+    )
+    parser.add_argument(
+        "--cc-model",
+        type=str,
+        default=os.environ.get("GOKU_CC_MODEL", "opus"),
+        help=(
+            "Model passed to the Claude Code CLI's --model (e.g. 'opus', "
+            "'sonnet', or a full id). Only used with --agent-backend claudecode."
+        ),
+    )
+    parser.add_argument(
+        "--cc-timeout",
+        type=int,
+        default=int(os.environ.get("GOKU_CC_TIMEOUT", "1800")),
+        help="Per-task wall-clock timeout (s) for the Claude Code CLI run.",
+    )
+    parser.add_argument(
+        "--codex-subscription",
+        action="store_true",
+        help=(
+            "Route the agent LLM (e.g. openai/gpt-5.5) through the OpenAI Codex "
+            "OAuth bridge so trajectory generation bills against this host's "
+            "ChatGPT Pro/Team subscription instead of a metered API key. Starts "
+            "the bridge and overrides the LLM config's base_url/api_key. Requires "
+            "`codex login` on this host. Uses the standard OpenHands backend."
+        ),
+    )
+    parser.add_argument(
         "--judge-llm-configs",
         type=str,
         default=None,
@@ -1248,6 +1493,30 @@ def main() -> None:
 
     llm = load_llm_config(args.llm_config_path)
     logger.info("Using LLM config: %s", llm.model_dump_json(indent=2))
+
+    # Codex subscription mode: start the OpenAI Codex OAuth bridge on the host and
+    # point the agent LLM at it, so the standard OpenHands agent drives gpt-5.5
+    # billed to this host's ChatGPT subscription (litellm honors base_url/api_key).
+    # The in-container agent-server reaches the host bridge via host.docker.internal.
+    codex_bridge = None
+    if args.codex_subscription:
+        import atexit
+
+        from pydantic import SecretStr
+
+        from benchmarks.utils.openai_codex import CodexBridge
+
+        codex_bridge = CodexBridge().start()
+        atexit.register(codex_bridge.stop)
+        llm.base_url = codex_bridge.container_base_url
+        # api_key is a pydantic SecretStr on the LLM model — wrap the plain stub so
+        # the LLM serializes cleanly when handed to the agent-server.
+        llm.api_key = SecretStr(codex_bridge.stub_api_key)
+        logger.info(
+            "Codex subscription mode active: model=%s routed through bridge %s",
+            llm.model,
+            codex_bridge.container_base_url,
+        )
 
     # Promote a Bedrock bearer token from `LLM.api_key` to the env var the
     # SDK actually reads. The vendored SDK drops `api_key` for Bedrock (see
@@ -1324,6 +1593,33 @@ def main() -> None:
     else:
         logger.info("No judge LLM config provided — will use env vars for judge")
 
+    # Start the Claude Code OAuth bridge once for the whole run when the
+    # claudecode backend is selected. It reads the host's Claude Code
+    # subscription token; the in-container CLI reaches it over
+    # host.docker.internal. atexit guarantees teardown even on error without
+    # re-indenting the run loop; stop() is idempotent.
+    cc_details: dict = {}
+    cc_bridge = None
+    if args.agent_backend == "claudecode":
+        import atexit
+
+        from benchmarks.utils.claude_oauth import ClaudeOAuthBridge
+
+        cc_bridge = ClaudeOAuthBridge().start()
+        atexit.register(cc_bridge.stop)
+        cc_details = {
+            "agent_backend": "claudecode",
+            "cc_bridge_url": cc_bridge.container_base_url,
+            "cc_bridge_api_key": cc_bridge.stub_api_key,
+            "cc_model": args.cc_model,
+            "cc_timeout_seconds": args.cc_timeout,
+        }
+        logger.info(
+            "Claude Code backend active: model=%s, bridge=%s",
+            args.cc_model,
+            cc_bridge.container_base_url,
+        )
+
     # Run evaluation for each run
     for run_num in range(1, args.runs + 1):
         logger.info(f"=== Run {run_num}/{args.runs} ===")
@@ -1399,6 +1695,9 @@ def main() -> None:
                 "tasks_dir": args.tasks_dir,
                 "run_number": run_num,
                 **council_details,
+                # Claude Code backend wiring (empty for the OpenHands backend):
+                # agent_backend + OAuth-bridge URL/secret + CLI model/timeout.
+                **cc_details,
                 # Hint stored for the delivery exporter — original LLM
                 # identifiers (metadata.llm.model, details.judge_model) stay
                 # authoritative; the exporter uses these display names when
@@ -1424,6 +1723,10 @@ def main() -> None:
     # Cleanup
     if instance_select_file:
         os.unlink(instance_select_file.name)
+    if cc_bridge is not None:
+        cc_bridge.stop()
+    if codex_bridge is not None:
+        codex_bridge.stop()
 
     logger.info("Goku evaluation complete.")
 
